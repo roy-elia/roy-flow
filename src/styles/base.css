@@ -1018,3 +1018,35 @@ textarea.field {
   background: none;
   width: 200px;
 }
+
+/* ------------------------------------------------------------------ desktop app (Electron) */
+.traffic-spacer {
+  width: 52px;
+  height: 12px;
+  margin: 8px 12px 8px 8px;
+}
+[data-electron] .titlebar {
+  -webkit-app-region: drag;
+}
+[data-electron] .titlebar button,
+[data-electron] .titlebar .menu,
+[data-electron] .titlebar .popover,
+[data-electron] .titlebar a,
+[data-electron] .titlebar input {
+  -webkit-app-region: no-drag;
+}
+.access-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 0 12px 8px;
+  padding: 10px 12px 10px 14px;
+  border-radius: 12px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  color: var(--foreground);
+  font-size: 14px;
+}
+.access-banner span {
+  flex: 1;
+}

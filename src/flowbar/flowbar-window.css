@@ -1,0 +1,95 @@
+/* Flow Bar panel window: fully transparent page, pill docked to the window edge that faces the screen edge. */
+html.flowbar-window,
+html.flowbar-window body {
+  background: transparent !important;
+  overflow: hidden;
+  user-select: none;
+  cursor: default;
+}
+.flowbar-window .flowbar-host {
+  bottom: 6px;
+}
+.flowbar-window .fb-note.error {
+  background: #2a0f0f;
+  border: 1px solid #7a2a2a;
+}
+.flowbar-window .fb-note {
+  font-size: 13px;
+  line-height: 18px;
+}
+.flowbar-window .fb-live {
+  max-width: 420px;
+}
+
+/* side docks: a 90-degree rotation of the bottom dock (UI_FLOWBAR.md §9) */
+.flowbar-host.dock-left,
+.flowbar-host.dock-right {
+  top: 50%;
+  bottom: auto;
+  transform: translateY(-50%);
+  flex-direction: row;
+  align-items: center;
+}
+.flowbar-host.dock-left {
+  left: 6px;
+  flex-direction: row-reverse;
+}
+.flowbar-host.dock-right {
+  left: auto;
+  right: 6px;
+}
+.dock-left .fb-note,
+.dock-right .fb-note,
+.dock-left .fb-live,
+.dock-right .fb-live,
+.dock-left .fb-tip,
+.dock-right .fb-tip {
+  max-width: 340px;
+}
+.dock-left .fb-hot,
+.dock-right .fb-hot {
+  flex-direction: column;
+}
+.dock-left .fb-pill,
+.dock-right .fb-pill {
+  flex-direction: column;
+}
+.dock-left .fb-pill.resting,
+.dock-right .fb-pill.resting {
+  width: 8px;
+  height: 40px;
+}
+.dock-left .fb-pill.ready,
+.dock-right .fb-pill.ready {
+  width: 30px;
+  height: 50px;
+}
+.dock-left .fb-pill.recording,
+.dock-right .fb-pill.recording {
+  width: 30px;
+  height: 103px;
+  padding: 6px 0;
+}
+.dock-left .fb-pill.processing,
+.dock-right .fb-pill.processing {
+  width: 30px;
+  height: 98px;
+  padding: 12px 0;
+}
+.dock-left .fb-wave,
+.dock-right .fb-wave {
+  flex-direction: column;
+  height: auto;
+  width: 20px;
+}
+.dock-left .fb-wave span,
+.dock-right .fb-wave span {
+  height: 3px;
+  min-width: 3px;
+  transition: width 0.08s linear;
+}
+.dock-left .fb-pickers,
+.dock-right .fb-pickers {
+  flex-direction: column;
+  padding: 2px 0 0;
+}

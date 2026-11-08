@@ -4,6 +4,7 @@ import { setState, toast, useStore } from '../store';
 import { go, openSettings, setNav, useNav, type PageId } from '../nav';
 import { DictionaryIcon, Glyph, InsightsIcon, NotetakerIcon, ScratchpadIcon, StyleIcon } from './icons';
 import { useClickOutside } from './ui';
+import { isElectron } from '../native/bridge';
 
 export function toggleTheme() {
   const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
@@ -22,11 +23,16 @@ export function TitleBar() {
   return (
     <header className="titlebar">
       <div className="titlebar-left">
-        <div className="traffic" aria-hidden>
-          <span />
-          <span />
-          <span />
-        </div>
+        {isElectron ? (
+          /* native traffic lights are drawn by macOS here (trafficLightPosition 16,15) */
+          <div className="traffic-spacer" aria-hidden />
+        ) : (
+          <div className="traffic" aria-hidden>
+            <span />
+            <span />
+            <span />
+          </div>
+        )}
         <button className="tb-btn" aria-label="Toggle sidebar" aria-expanded={open} onClick={() => setState({ sidebarOpen: !open })} data-tip="Toggle sidebar" data-tip-pos="bottom">
           <PanelLeft size={20} strokeWidth={1.8} />
         </button>

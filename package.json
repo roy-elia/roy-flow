@@ -6,18 +6,81 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
-    "preview": "vite preview"
-  },
-  "dependencies": {
-    "lucide-react": "^1.70.0",
-    "react": "^19.3.1",
-    "react-dom": "^19.3.1"
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.electron.json",
+    "native": "sh native/build.sh",
+    "icons": "sh scripts/make-icons.sh",
+    "electron:build": "node scripts/build-electron.mjs",
+    "app:dev": "npm run native && npm run electron:build && concurrently -k -n vite,app \"vite\" \"wait-on tcp:5188 && ROYFLOW_DEV_URL=http://localhost:5188 electron .\"",
+    "app:build": "npm run typecheck && vite build && npm run electron:build && npm run native && electron-builder --mac dir --arm64 && sh scripts/sign.sh",
+    "app:install": "sh scripts/install.sh"
   },
   "devDependencies": {
+    "@types/node": "^26.6.6",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
     "@vitejs/plugin-react": "^6.2.1",
+    "concurrently": "^10.0.7",
+    "electron": "^45.2.3",
+    "electron-builder": "^26.18.0",
+    "esbuild": "^0.28.2",
+    "lucide-react": "^1.70.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
     "typescript": "^7.0.2",
-    "vite": "^8.3.6"
+    "vite": "^8.3.6",
+    "wait-on": "^9.5.1"
+  },
+  "description": "Roy Flow: a dictation app UI, as a web app and a macOS desktop app",
+  "author": "Roy Elia",
+  "main": "dist-electron/main.cjs",
+  "build": {
+    "appId": "com.royelia.royflow",
+    "productName": "Roy Flow",
+    "copyright": "Copyright \u00a9 2026 Roy Elia",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "dist/**/*",
+      "dist-electron/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "native/build/RoyFlowHelper",
+        "to": "RoyFlowHelper"
+      },
+      {
+        "from": "resources",
+        "to": "tray",
+        "filter": [
+          "trayTemplate*.png"
+        ]
+      }
+    ],
+    "asar": true,
+    "mac": {
+      "category": "public.app-category.productivity",
+      "icon": "build/icon.icns",
+      "target": [
+        {
+          "target": "dir",
+          "arch": [
+            "arm64"
+          ]
+        }
+      ],
+      "identity": null,
+      "hardenedRuntime": false,
+      "gatekeeperAssess": false,
+      "darkModeSupport": true,
+      "extendInfo": {
+        "NSMicrophoneUsageDescription": "Roy Flow listens to your microphone while you dictate.",
+        "NSSpeechRecognitionUsageDescription": "Roy Flow turns your speech into text, on this Mac when supported.",
+        "NSAppleEventsUsageDescription": "Roy Flow pastes dictated text into the app you are using."
+      }
+    }
   }
 }

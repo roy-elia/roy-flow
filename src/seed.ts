@@ -183,6 +183,8 @@ export function seedState(): State {
       language: 'English',
       microphone: 'Built-in mic (recommended)',
       pttKey: 'fn',
+      toggleShortcut: 'Alt+Space',
+      flowBarDock: 'Bottom',
       transformsOptIn: true,
       autoApply: false,
       autoApplyTransform: 'Polish',

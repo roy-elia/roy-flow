@@ -13,6 +13,9 @@ import Transforms from './pages/Transforms';
 import Scratchpad, { ScratchpadWindow } from './pages/Scratchpad';
 import SettingsModal from './settings/SettingsModal';
 import FlowBar from './flowbar/FlowBar';
+import HubBridge from './native/HubBridge';
+import AccessBanner from './native/AccessBanner';
+import { isElectron } from './native/bridge';
 
 export default function App() {
   const theme = useStore((s) => s.theme);
@@ -24,6 +27,7 @@ export default function App() {
   return (
     <div className="window">
       <TitleBar />
+      <AccessBanner />
       <div className="app-body">
         <Sidebar />
         {page === 'home' && <Home />}
@@ -36,7 +40,8 @@ export default function App() {
         {page === 'scratchpad' && <Scratchpad />}
       </div>
       <ScratchpadWindow />
-      <FlowBar />
+      {/* in the desktop app the Flow Bar lives in its own always-on-top panel window */}
+      {isElectron ? <HubBridge /> : <FlowBar />}
       <SettingsModal />
       {modal === 'help' && <HelpDialog />}
       {modal === 'referral' && <ReferralDialog />}

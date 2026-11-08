@@ -21,6 +21,8 @@ import { go, openSettings, setNav, useNav, type SettingsTab } from '../nav';
 import { ConnectorsIcon, McpIcon, NotetakerIcon } from '../components/icons';
 import { Confirm, Dialog, Dropdown, Info, Switch } from '../components/ui';
 import { toggleTheme } from '../components/Shell';
+import { native } from '../native/bridge';
+import { acceleratorLabel, DEFAULT_TOGGLE_SHORTCUT } from '../shared/ipc';
 
 const APP_TABS: { id: SettingsTab; label: string; icon: ReactNode }[] = [
   { id: 'general', label: 'General', icon: <SlidersHorizontal size={18} /> },
@@ -176,6 +178,16 @@ function General() {
             Change
           </button>
         </Row>
+        <Row
+          label="Hands-free dictation"
+          desc={
+            <>
+              Press <span className="key-inline">{acceleratorLabel((s.toggleShortcut as string) || DEFAULT_TOGGLE_SHORTCUT)}</span> anywhere to start, press again to paste.
+            </>
+          }
+        >
+          <ShortcutRecorder />
+        </Row>
         <Row label="Microphone" desc={s.microphone as string}>
           <button className="btn btn-secondary set-btn" onClick={() => setDlg('mic')}>
             Change
@@ -223,6 +235,46 @@ function General() {
         />
       )}
     </Page>
+  );
+}
+
+const CODE_KEYS: Record<string, string> = { Space: 'Space', Enter: 'Return', Escape: 'Escape', Tab: 'Tab', Backspace: 'Backspace', ArrowUp: 'Up', ArrowDown: 'Down', ArrowLeft: 'Left', ArrowRight: 'Right', Backquote: '`', Minus: '-', Equal: '=', Comma: ',', Period: '.', Slash: '/', Semicolon: ';', Quote: "'", BracketLeft: '[', BracketRight: ']', Backslash: '\\' };
+function codeToKey(code: string): string | null {
+  if (/^Key[A-Z]$/.test(code)) return code.slice(3);
+  if (/^Digit[0-9]$/.test(code)) return code.slice(5);
+  if (/^F([1-9]|1[0-9]|2[0-4])$/.test(code)) return code;
+  return CODE_KEYS[code] ?? null;
+}
+
+/** records a key combination as an Electron accelerator for the global toggle shortcut */
+function ShortcutRecorder() {
+  const [rec, setRec] = useState(false);
+  useEffect(() => {
+    if (!rec) return;
+    const onKey = (e: KeyboardEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.key === 'Escape' && !e.metaKey && !e.altKey && !e.ctrlKey && !e.shiftKey) return setRec(false);
+      const key = codeToKey(e.code);
+      if (!key) return; // modifier only, keep listening
+      const mods = [e.ctrlKey && 'Control', e.altKey && 'Alt', e.shiftKey && 'Shift', e.metaKey && 'Command'].filter(Boolean) as string[];
+      if (!mods.length && !/^F\d+$/.test(key)) return toast('Use at least one modifier key (⌃ ⌥ ⇧ ⌘)', { tone: 'error' });
+      const acc = [...mods, key].join('+');
+      setRec(false);
+      const apply = () => {
+        setSetting('toggleShortcut', acc);
+        toast(`Shortcut set to ${acceleratorLabel(acc)}`);
+      };
+      if (!native) return apply();
+      native.invoke('shortcut:set', { accelerator: acc }).then((r) => (r.ok ? apply() : toast(r.error ?? 'That shortcut is in use by another app', { tone: 'error' })));
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, [rec]);
+  return (
+    <button className="btn btn-secondary set-btn" onClick={() => setRec(!rec)} aria-live="polite">
+      {rec ? 'Press keys…' : 'Change'}
+    </button>
   );
 }
 
@@ -283,6 +335,9 @@ function System() {
         <Card>
           <Toggle k="launchAtLogin" label="Launch app at login" />
           <Toggle k="showFlowBar" label="Show Flow Bar at all times" />
+          <Row label="Flow Bar position" desc="Where the Flow Bar docks on screen">
+            <Select k="flowBarDock" options={['Bottom', 'Left', 'Right']} width={165} />
+          </Row>
           <Toggle k="showInDock" label="Show app in dock" />
         </Card>
       </Section>

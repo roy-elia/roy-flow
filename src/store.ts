@@ -1,5 +1,6 @@
 import { useSyncExternalStore } from 'react';
 import { seedState } from './seed';
+import { applyDictionaryAndSnippets as applyShared, cleanUp, wordCount } from './shared/textPipeline';
 
 export type Scope = 'personal' | 'team';
 export interface HistoryItem {
@@ -162,37 +163,8 @@ export function useToasts() {
   );
 }
 
-/* ------------------------------------------------------------------ text pipeline */
+/* ------------------------------------------------------------------ text pipeline (shared with Electron main) */
+export { cleanUp, wordCount };
 export function applyDictionaryAndSnippets(text: string, s: State = state): string {
-  let out = text;
-  for (const w of s.dictionary) {
-    if (w.misspelling) {
-      const re = new RegExp(`\\b${escapeRe(w.misspelling)}\\b`, 'gi');
-      out = out.replace(re, w.word);
-    } else {
-      // fix casing of known words
-      const re = new RegExp(`\\b${escapeRe(w.word)}\\b`, 'gi');
-      out = out.replace(re, w.word);
-    }
-  }
-  for (const sn of s.snippets) {
-    const re = new RegExp(`\\b${escapeRe(sn.trigger)}\\b`, 'gi');
-    out = out.replace(re, sn.expansion);
-  }
-  return out;
+  return applyShared(text, s.dictionary, s.snippets);
 }
-
-/** a light "AI clean-up": drop filler words, capitalise, end with punctuation */
-export function cleanUp(text: string): string {
-  let t = text.replace(/\b(um+|uh+|erm|you know|like,)\s*/gi, '').replace(/\s+/g, ' ').trim();
-  if (!t) return t;
-  t = t.charAt(0).toUpperCase() + t.slice(1);
-  if (!/[.!?]$/.test(t)) t += '.';
-  return t;
-}
-
-function escapeRe(s: string) {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-export const wordCount = (t: string) => (t.trim() ? t.trim().split(/\s+/).length : 0);
