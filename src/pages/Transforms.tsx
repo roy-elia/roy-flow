@@ -1,9 +1,14 @@
 import { useState } from 'react';
 import { Plus, RotateCcw, Trash2, X } from 'lucide-react';
-import { cleanUp, setSetting, setState, toast, uid, useStore, type Transform } from '../store';
-import { seedState } from '../seed';
-import { Confirm, Dialog, Dropdown, Hero, Info, Keys, PageFrame, Switch } from '../components/ui';
+import { cleanUp, getState, setSetting, setState, toast, uid, useStore, type Transform } from '../store';
+import { defaultTransforms } from '../seed';
+import { Confirm, Dialog, Dropdown, Hero, Info, PageFrame, Switch } from '../components/ui';
+import { native } from '../native/bridge';
+import { setNav } from '../nav';
+import { KeyChips, useShortcutLabel } from '../settings/ShortcutsEditor';
+import { allActions, bindingsOf, chordId, DEFAULT_TRANSFORM_HOTKEYS, normalize, transformAction, validateChord, type Chord } from '../shared/hotkeys';
 
+/** rule-based stand-in used by the browser build (the desktop app runs Transforms with Claude) */
 export function runTransform(t: Transform, text: string) {
   const base = cleanUp(text);
   if (t.name === 'Polish')
@@ -15,19 +20,15 @@ export function runTransform(t: Transform, text: string) {
   return `${base}`;
 }
 
-const COMBOS = [
-  ['cmd', 'opt'],
-  ['ctrl', 'opt'],
-  ['cmd', 'shift'],
-  ['ctrl', 'shift'],
-  ['opt', 'shift'],
-];
+const COMBOS: Chord[] = [...'123456789'.split('').map((d) => ['opt', d]), ...'123456789'.split('').map((d) => ['ctrl', 'opt', d])];
 
 export default function Transforms() {
   const transforms = useStore((s) => s.transforms);
   const optIn = useStore((s) => s.settings.transformsOptIn as boolean);
   const autoApply = useStore((s) => s.settings.autoApply as boolean);
   const autoT = useStore((s) => s.settings.autoApplyTransform as string);
+  const hotkeys = useStore((s) => s.hotkeys);
+  const changesKey = useShortcutLabel('viewChanges');
   const [editor, setEditor] = useState<null | { edit?: Transform }>(null);
   const [reset, setReset] = useState(false);
   const [tryIt, setTryIt] = useState(false);
@@ -45,9 +46,8 @@ export default function Transforms() {
             Opt in <Info tip="Turn Transforms on to rewrite selected text with a shortcut." />
           </span>
           <Switch on={optIn} onChange={(v) => setSetting('transformsOptIn', v)} label="Opt in" />
-          <button className="chip-row" onClick={() => toast('Hold ⌥ Opt + O after a Transform to compare versions')}>
-            <kbd className="key">⌥ Opt</kbd>
-            <kbd className="key">o</kbd> to view changes
+          <button className="chip-row" onClick={() => (changesKey ? toast(`After a Transform runs, press ${changesKey} to compare the before and after`) : setNav({ modal: 'shortcuts' }))}>
+            {changesKey ? <KeyChips chord={bindingsOf(hotkeys, 'viewChanges')[0]} /> : <span style={{ paddingLeft: 12 }}>Set a shortcut</span>} to view changes
           </button>
         </div>
       }
@@ -68,7 +68,7 @@ export default function Transforms() {
               <button className="btn btn-lumen" onClick={() => setTryIt(true)}>
                 Try it out
               </button>
-              <button className="btn" style={{ color: 'var(--lumen-text)' }} onClick={() => toast('Select text anywhere, then press a Transform shortcut')}>
+              <button className="btn" style={{ color: 'var(--lumen-text)' }} onClick={() => toast('Select text in any app, then press a Transform shortcut. With nothing selected, it rewrites your last dictation.')}>
                 How it works
               </button>
             </>
@@ -111,7 +111,7 @@ export default function Transforms() {
         <div className="tf-cards">
           {transforms.map((t) => (
             <button key={t.id} className="tf-card" onClick={() => setEditor({ edit: t })}>
-              <Keys keys={t.keys} />
+              {bindingsOf(hotkeys, `transform:${t.id}`)[0] ? <KeyChips chord={bindingsOf(hotkeys, `transform:${t.id}`)[0]} /> : <span className="muted small">No shortcut</span>}
               <div className="tf-title">{t.name}</div>
               <div className="muted ellipsis">{t.description}</div>
             </button>
@@ -135,7 +135,12 @@ export default function Transforms() {
           confirm="Yes"
           onClose={() => setReset(false)}
           onConfirm={() => {
-            setState({ transforms: seedState().transforms });
+            const t = defaultTransforms();
+            setState((s) => {
+              const hk = Object.fromEntries(Object.entries(s.hotkeys).filter(([k]) => !k.startsWith('transform:')));
+              for (const x of t) hk[`transform:${x.id}`] = structuredClone(DEFAULT_TRANSFORM_HOTKEYS[x.id] ?? []);
+              return { transforms: t, hotkeys: hk };
+            });
             toast('Settings reset');
           }}
         />
@@ -148,13 +153,34 @@ function TryIt({ onClose }: { onClose: () => void }) {
   const transforms = useStore((s) => s.transforms);
   const [name, setName] = useState(transforms[0]?.name ?? 'Polish');
   const [text, setText] = useState('so um basically I really think we should actually move the meeting to friday in order to give everyone more time');
+  const [result, setResult] = useState('');
+  const [busy, setBusy] = useState(false);
   const t = transforms.find((x) => x.name === name)!;
+  const run = async () => {
+    if (!t) return;
+    if (!native) return setResult(runTransform(t, text));
+    setBusy(true);
+    const r = await native.invoke('ai:transform', { text, prompt: t.prompt, name: t.name });
+    setBusy(false);
+    if (r.ok) setResult(r.text ?? '');
+    else toast(r.error ?? 'Transform failed', { tone: 'error' });
+  };
   return (
-    <Dialog title="Try a Transform" subtitle="Type or paste some text, pick a Transform and see the result." onClose={onClose} width={560}>
-      <Dropdown value={name} options={transforms.map((x) => x.name)} onChange={setName} align="left" />
+    <Dialog
+      title="Try a Transform"
+      subtitle="Type or paste some text, pick a Transform and run it."
+      onClose={onClose}
+      width={560}
+      actions={
+        <button className="btn btn-primary" disabled={busy || !text.trim()} onClick={run}>
+          {busy ? 'Running…' : 'Run'}
+        </button>
+      }
+    >
+      <Dropdown value={name} options={transforms.map((x) => x.name)} onChange={(v) => (setName(v), setResult(''))} align="left" />
       <textarea className="field" style={{ minHeight: 100 }} value={text} onChange={(e) => setText(e.target.value)} />
       <div className="caps muted">Result</div>
-      <div className="tf-result">{t ? runTransform(t, text) : ''}</div>
+      <div className="tf-result">{result || <span className="muted">Press Run to see the result.</span>}</div>
     </Dialog>
   );
 }
@@ -162,21 +188,31 @@ function TryIt({ onClose }: { onClose: () => void }) {
 function TransformEditor({ edit, onClose }: { edit?: Transform; onClose: () => void }) {
   const transforms = useStore((s) => s.transforms);
   const [name, setName] = useState(edit?.name ?? '');
-  const [keys, setKeys] = useState(edit?.keys.join('+') ?? '');
+  const hotkeys = useStore((s) => s.hotkeys);
+  const [id] = useState(() => edit?.id ?? uid());
+  const cur = bindingsOf(hotkeys, `transform:${id}`)[0];
+  const [keys, setKeys] = useState(cur ? chordId(cur) : '');
   const [prompt, setPrompt] = useState(edit?.prompt ?? '');
   const [del, setDel] = useState(false);
-  const conflict = transforms.find((t) => t.id !== edit?.id && t.keys.join('+') === keys);
+  const action = transformAction({ id, name: name || 'This Transform' });
+  const others = { ...hotkeys, [action.id]: [] };
+  const conflict = keys ? validateChord(action, keys.split('+'), others, allActions([...transforms.filter((t) => t.id !== id), { id, name }])) : null;
+  const options = [...new Set([...(cur ? [chordId(cur)] : []), ...COMBOS.map((c) => chordId(c))])];
   const save = () => {
     if (!name.trim()) return toast('Give your Transform a name', { tone: 'error' });
     const t: Transform = {
-      id: edit?.id ?? uid(),
+      id,
       name: name.trim(),
       prompt,
       description: edit?.builtin ? edit.description : prompt.split(/\s+/).slice(0, 7).join(' ') + (prompt ? '...' : ''),
-      keys: keys ? keys.split('+') : [],
+      keys: [],
       builtin: edit?.builtin,
     };
-    setState((s) => ({ transforms: edit ? s.transforms.map((x) => (x.id === edit.id ? t : x)) : [...s.transforms, t] }));
+    setState((s) => ({
+      transforms: edit ? s.transforms.map((x) => (x.id === edit.id ? t : x)) : [...s.transforms, t],
+      hotkeys: { ...s.hotkeys, [`transform:${id}`]: keys ? [normalize(keys.split('+'))] : [] },
+    }));
+    if (edit && edit.name !== t.name && getState().settings.autoApplyTransform === edit.name) setSetting('autoApplyTransform', t.name);
     toast('Saved');
     onClose();
   };
@@ -213,10 +249,13 @@ function TransformEditor({ edit, onClose }: { edit?: Transform; onClose: () => v
               <Dropdown
                 value={keys}
                 align="left"
-                options={[{ value: '', label: 'No shortcut' }, ...COMBOS.map((c) => ({ value: c.join('+'), label: <Keys keys={c} small /> }))]}
+                options={[{ value: '', label: 'No shortcut' }, ...options.map((c) => ({ value: c, label: <KeyChips chord={c.split('+')} small /> }))]}
                 onChange={setKeys}
               />
-              {conflict && <span className="small" style={{ color: 'var(--destructive)' }}>Already used by {conflict.name}</span>}
+              {conflict && <span className="small" style={{ color: 'var(--destructive)' }}>{conflict}</span>}
+              <button className="link small" style={{ alignSelf: 'flex-start' }} onClick={() => setNav({ modal: 'shortcuts' })}>
+                More options in Shortcuts
+              </button>
             </div>
             <label className="tf-field">
               <span className="field-label">Prompt</span>
@@ -247,7 +286,11 @@ function TransformEditor({ edit, onClose }: { edit?: Transform; onClose: () => v
           title={`Delete ${edit.name}?`}
           onClose={() => setDel(false)}
           onConfirm={() => {
-            setState((s) => ({ transforms: s.transforms.filter((t) => t.id !== edit.id) }));
+            setState((s) => {
+              const hk = { ...s.hotkeys };
+              delete hk[`transform:${edit.id}`];
+              return { transforms: s.transforms.filter((t) => t.id !== edit.id), hotkeys: hk };
+            });
             onClose();
           }}
         />

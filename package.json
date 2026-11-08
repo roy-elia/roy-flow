@@ -1,7 +1,7 @@
 {
   "name": "roy-flow",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -13,7 +13,8 @@
     "electron:build": "node scripts/build-electron.mjs",
     "app:dev": "npm run native && npm run electron:build && concurrently -k -n vite,app \"vite\" \"wait-on tcp:5188 && ROYFLOW_DEV_URL=http://localhost:5188 electron .\"",
     "app:build": "npm run typecheck && vite build && npm run electron:build && npm run native && electron-builder --mac dir --arm64 && sh scripts/sign.sh",
-    "app:install": "sh scripts/install.sh"
+    "app:install": "sh scripts/install.sh",
+    "sounds": "node scripts/make-sounds.mjs"
   },
   "devDependencies": {
     "@types/node": "^26.6.6",
@@ -37,7 +38,7 @@
   "build": {
     "appId": "com.royelia.royflow",
     "productName": "Roy Flow",
-    "copyright": "Copyright \u00a9 2026 Roy Elia",
+    "copyright": "Copyright © 2026 Roy Elia",
     "directories": {
       "output": "release",
       "buildResources": "build"
@@ -58,6 +59,14 @@
         "filter": [
           "trayTemplate*.png"
         ]
+      },
+      {
+        "from": "resources/sounds",
+        "to": "sounds"
+      },
+      {
+        "from": "dist-electron/mcp-stdio.cjs",
+        "to": "mcp/mcp-stdio.cjs"
       }
     ],
     "asar": true,
@@ -79,8 +88,13 @@
       "extendInfo": {
         "NSMicrophoneUsageDescription": "Roy Flow listens to your microphone while you dictate.",
         "NSSpeechRecognitionUsageDescription": "Roy Flow turns your speech into text, on this Mac when supported.",
-        "NSAppleEventsUsageDescription": "Roy Flow pastes dictated text into the app you are using."
+        "NSAppleEventsUsageDescription": "Roy Flow pastes dictated text into the app you are using.",
+        "NSCalendarsUsageDescription": "Roy Flow shows your upcoming meetings on the Notetaker page and in the menu bar.",
+        "NSCalendarsFullAccessUsageDescription": "Roy Flow shows your upcoming meetings on the Notetaker page and in the menu bar."
       }
     }
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.6.0"
   }
 }

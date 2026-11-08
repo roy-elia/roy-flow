@@ -1,4 +1,4 @@
-import type { State } from './store';
+import type { DictWord, HistoryItem, Meeting, Snippet, Transform } from './shared/types';
 
 const now = Date.now();
 const today = (h: number, m: number) => {
@@ -13,12 +13,84 @@ const daysAgo = (n: number, h: number, m: number) => {
   return d.getTime();
 };
 
-export function seedState(): State {
+/* Default settings and transforms for a fresh install, plus optional demo data
+   (Settings › Data and Privacy › Load demo data). Real installs start empty. */
+
+export function defaultSettings(): Record<string, string | boolean> {
   return {
-    theme: 'light',
-    sidebarOpen: true,
-    user: { firstName: 'Jordan', lastName: 'Lee', email: 'jordan@example.com' },
-    history: [
+      launchAtLogin: false,
+      showFlowBar: true,
+      showInDock: false,
+      sounds: true,
+      muteWhileDictating: false,
+      suggestions: true,
+      announcements: true,
+      milestones: true,
+      autoAddDictionary: true,
+      creatorMode: false,
+      fileTagging: true,
+      notifyBefore: '1 min',
+      showNextMeeting: true,
+      detectCalls: true,
+      autoStartNotetaker: false,
+      maxRecording: '2 hours',
+      stopWhenCallEnds: true,
+      hideInCapture: false,
+      notepadView: 'Open Notepad',
+      liveTranscript: true,
+      calendarNotice: 'Off',
+      consentNotice: false,
+      linkDefault: 'Anyone with the link',
+      autoShareWho: 'no one',
+      autoShareFor: 'all meetings',
+      appLanguage: 'English',
+      language: 'English',
+      microphone: 'Built-in mic (recommended)',
+      flowBarDock: 'Bottom',
+      transformsOptIn: true,
+      autoApply: false,
+      autoApplyTransform: 'Polish',
+      scratchpadInBar: true,
+      scratchpadOpen: 'Resume last note',
+      contextAwareness: true,
+      localStorage: 'Store normally',
+      connected_gcal: false,
+      connected_outlook: false,
+      connected_slack: false,
+      connected_gmail: false,
+      connected_notion: false,
+      notetakerAutoPromptDismissed: false,
+      autoCleanup: 'Medium',
+      aiCleanup: true,
+    };
+}
+
+export function defaultTransforms(): Transform[] {
+  return [
+      {
+        id: 't1',
+        name: 'Polish',
+        description: 'Improve clarity and conciseness',
+        prompt: 'Rewrite the text so it is clearer and more concise while keeping my voice.',
+        keys: [],
+        builtin: true,
+      },
+      {
+        id: 't2',
+        name: 'Prompt Engineer',
+        description: '**Title** (1 concise line)...',
+        prompt: '**Title** (1 concise line)\n**Goal** what the model should do\n**Context** relevant details\n**Output** the format I want back',
+        keys: [],
+        builtin: true,
+      },
+    ];
+}
+
+/** ids the pre-1.1 build seeded into localStorage; dropped when migrating */
+export const LEGACY_DEMO_IDS = new Set(['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'h7', 'h8', 'm1', 'm2', 'm3', 'm4', 'm5', 'd1', 'd2', 'd3', 'd4', 'd5', 's1', 's2', 's3']);
+
+export function demoData(): { history: HistoryItem[]; dictionary: DictWord[]; snippets: Snippet[]; meetings: Meeting[] } {
+  const history: HistoryItem[] = [
       { id: 'h1', ts: today(21, 43), text: 'Remind me to send the slides tonight.', status: 'dismissed' },
       {
         id: 'h2',
@@ -61,15 +133,15 @@ export function seedState(): State {
         status: 'ok',
         app: 'Reminders',
       },
-    ],
-    dictionary: [
+    ];
+  const dictionary: DictWord[] = [
       { id: 'd1', word: 'Jordan Lee', scope: 'personal', created: now - 5e8 },
       { id: 'd2', word: 'Jordan', scope: 'personal', created: now - 4e8 },
       { id: 'd3', word: 'Roy Flow', scope: 'personal', created: now - 3e8 },
       { id: 'd4', word: 'by the way', misspelling: 'btw', scope: 'personal', created: now - 2e8 },
       { id: 'd5', word: 'jordan@example.com', scope: 'personal', created: now - 1e8 },
-    ],
-    snippets: [
+    ];
+  const snippets: Snippet[] = [
       {
         id: 's1',
         trigger: 'my portfolio link',
@@ -86,9 +158,8 @@ export function seedState(): State {
         scope: 'personal',
         created: now - 1e8,
       },
-    ],
-    notes: [],
-    meetings: [
+    ];
+  const meetings: Meeting[] = [
       {
         id: 'm1',
         title: 'Quarterly Roadmap Sync',
@@ -132,79 +203,11 @@ export function seedState(): State {
         shared: true,
         overview: 'Shared by a teammate. Priorities for the week: finish the billing page, triage support inbox, and prep the demo.',
       },
-    ],
-    transforms: [
-      {
-        id: 't1',
-        name: 'Polish',
-        description: 'Improve clarity and conciseness',
-        prompt: 'Rewrite the text so it is clearer and more concise while keeping my voice.',
-        keys: ['cmd', 'opt'],
-        builtin: true,
-      },
-      {
-        id: 't2',
-        name: 'Prompt Engineer',
-        description: '**Title** (1 concise line)...',
-        prompt: '**Title** (1 concise line)\n**Goal** what the model should do\n**Context** relevant details\n**Output** the format I want back',
-        keys: ['ctrl', 'opt'],
-        builtin: true,
-      },
-    ],
-    dismissed: {},
-    checklist: { try: true },
-    settings: {
-      launchAtLogin: true,
-      showFlowBar: true,
-      showInDock: false,
-      sounds: true,
-      muteWhileDictating: true,
-      suggestions: true,
-      announcements: true,
-      milestones: true,
-      autoAddDictionary: true,
-      creatorMode: false,
-      fileTagging: true,
-      notifyBefore: '15 sec',
-      showNextMeeting: true,
-      detectCalls: true,
-      autoStartNotetaker: false,
-      maxRecording: '2 hours',
-      stopWhenCallEnds: true,
-      hideInCapture: false,
-      notepadView: 'Open Notepad',
-      liveTranscript: true,
-      calendarNotice: 'Off',
-      consentNotice: false,
-      linkDefault: 'Anyone with the link',
-      autoShareWho: 'no one',
-      autoShareFor: 'all meetings',
-      appLanguage: 'English',
-      language: 'English',
-      microphone: 'Built-in mic (recommended)',
-      pttKey: 'fn',
-      toggleShortcut: 'Alt+Space',
-      flowBarDock: 'Bottom',
-      transformsOptIn: true,
-      autoApply: false,
-      autoApplyTransform: 'Polish',
-      scratchpadInBar: true,
-      scratchpadOpen: 'Resume last note',
-      improveModel: true,
-      cloudStorage: true,
-      contextAwareness: true,
-      publicInfo: false,
-      localStorage: 'Store normally',
-      billing: 'Monthly',
-      connected_gcal: false,
-      connected_outlook: false,
-      connected_slack: false,
-      connected_gmail: false,
-      connected_notion: false,
-      notetakerAutoPromptDismissed: false,
-      autoCleanup: 'Medium',
-    },
-    styles: { personal: 'casual', work: 'formal', email: 'formal', other: 'casual' },
-    totals: { words: 27900, wpm: 121, streak: 2 },
+    ];
+  return {
+    history: history.map((h) => ({ ...h, id: `demo-${h.id}`, words: h.text.split(/\s+/).length, durationMs: h.text.split(/\s+/).length * 450 })),
+    dictionary: dictionary.map((d) => ({ ...d, id: `demo-${d.id}` })),
+    snippets: snippets.map((x) => ({ ...x, id: `demo-${x.id}` })),
+    meetings: meetings.map((m) => ({ ...m, id: `demo-${m.id}`, demo: true, actionItems: ['Share the notes with everyone who attended'] })),
   };
 }

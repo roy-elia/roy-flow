@@ -20,9 +20,11 @@ import {
   Underline,
   X,
 } from 'lucide-react';
-import { setSetting, setState, toast, uid, useStore, type Note } from '../store';
+import { getState, setSetting, setState, toast, uid, useStore, type Note } from '../store';
 import { getNav, setNav, useNav } from '../nav';
 import { Confirm, Hero, Info, PageFrame, SearchToggle, Switch } from '../components/ui';
+import { native } from '../native/bridge';
+import { useShortcutLabel } from '../settings/ShortcutsEditor';
 
 const strip = (html: string) => {
   const d = document.createElement('div');
@@ -39,7 +41,7 @@ export function newNote(content = ''): string {
 export default function Scratchpad() {
   const notes = useStore((s) => s.notes);
   const inBar = useStore((s) => s.settings.scratchpadInBar as boolean);
-  const shortcut = useStore((s) => s.settings.scratchpadShortcut as boolean | undefined);
+  const shortcut = useShortcutLabel('scratchpad');
   const [q, setQ] = useState('');
   const [spin, setSpin] = useState(false);
   const [del, setDel] = useState<Note | null>(null);
@@ -64,20 +66,13 @@ export default function Scratchpad() {
             Add to Flow Bar <Info tip="Show a Scratchpad button on the Flow Bar so you can open notes from anywhere." />
           </span>
           <Switch on={inBar} onChange={(v) => setSetting('scratchpadInBar', v)} label="Add to Flow Bar" />
-          <button
-            className="chip-row muted-chip"
-            onClick={() => {
-              setSetting('scratchpadShortcut', !shortcut);
-              toast(shortcut ? 'Shortcut disabled' : 'Press ⌥ Opt + Space to open Scratchpad');
-            }}
-          >
+          <button className="chip-row muted-chip" onClick={() => (native ? native.send('scratchpad:open') : open(newNote()))} data-tip="Change the shortcut in Settings › General › Shortcuts">
             {shortcut ? (
               <>
-                <kbd className="key">⌥ Opt</kbd>
-                <kbd className="key">Space</kbd> to Open
+                <kbd className="key">{shortcut}</kbd> to Open
               </>
             ) : (
-              <span style={{ padding: '4px 0 4px 12px' }}>Click to enable shortcut</span>
+              <span style={{ padding: '4px 0 4px 12px' }}>Open in its own window</span>
             )}
           </button>
         </div>
@@ -183,11 +178,11 @@ export default function Scratchpad() {
 }
 
 /* ================================================================== editor window */
-export function ScratchpadWindow() {
+export function ScratchpadWindow({ standalone }: { standalone?: boolean } = {}) {
   const noteId = useNav((n) => n.noteId);
   const notes = useStore((s) => s.notes);
   const [tabs, setTabs] = useState<string[]>([]);
-  const [side, setSide] = useState(false);
+  const [side, setSide] = useState(standalone && getState().settings.scratchpadOpen === 'Show all notes');
   const [big, setBig] = useState(false);
   const ed = useRef<HTMLDivElement>(null);
   const note = notes.find((n) => n.id === noteId);
@@ -216,11 +211,13 @@ export function ScratchpadWindow() {
   const live = tabs.filter((t) => notes.some((n) => n.id === t));
 
   return (
-    <div className={`sp-window ${big ? 'big' : ''}`} role="dialog" aria-label="Scratchpad">
+    <div className={`sp-window ${big ? 'big' : ''} ${standalone ? 'standalone' : ''}`} role="dialog" aria-label="Scratchpad">
       <div className="sp-win-bar">
-        <button className="icon-btn" aria-label="Close Scratchpad" onClick={() => (setTabs([]), setNav({ noteId: null }))}>
-          <X size={16} />
-        </button>
+        {!standalone && (
+          <button className="icon-btn" aria-label="Close Scratchpad" onClick={() => (setTabs([]), setNav({ noteId: null }))}>
+            <X size={16} />
+          </button>
+        )}
         <button className={`icon-btn ${side ? 'active' : ''}`} aria-label="Toggle sidebar" onClick={() => setSide(!side)}>
           <PanelLeft size={16} />
         </button>
@@ -246,9 +243,11 @@ export function ScratchpadWindow() {
             <Plus size={14} />
           </button>
         </div>
-        <button className="icon-btn" aria-label={big ? 'Compact' : 'Expand'} onClick={() => setBig(!big)}>
-          {big ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
-        </button>
+        {!standalone && (
+          <button className="icon-btn" aria-label={big ? 'Compact' : 'Expand'} onClick={() => setBig(!big)}>
+            {big ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
+          </button>
+        )}
       </div>
       <div className="sp-win-main">
         {side && (
@@ -327,4 +326,30 @@ export function appendToOpenNote(text: string): boolean {
     setState((s) => ({ notes: s.notes.map((n) => (n.id === id ? { ...n, html: el.innerHTML, updated: Date.now() } : n)) }));
   }
   return true;
+}
+
+/** the Scratchpad as its own desktop window (Open Scratchpad shortcut, Flow Bar button) */
+export function ScratchpadApp() {
+  const theme = useStore((s) => s.theme);
+  const noteId = useNav((n) => n.noteId);
+  const started = useRef(false);
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+  }, [theme]);
+  useEffect(() => {
+    const st = getState();
+    const recent = [...st.notes].sort((a, b) => b.updated - a.updated)[0];
+    const mode = st.settings.scratchpadOpen;
+    setNav({ noteId: mode === 'Start a new note' || !recent ? newNote() : recent.id });
+    started.current = true;
+  }, []);
+  // closing the last tab closes the window
+  useEffect(() => {
+    if (started.current && noteId === null && native) native.send('scratchpad:close');
+  }, [noteId]);
+  return (
+    <div className="sp-standalone">
+      <ScratchpadWindow standalone />
+    </div>
+  );
 }

@@ -1,6 +1,6 @@
 import { Bell, Check, CircleHelp, CircleUserRound, Gift, Mic, Moon, PanelLeft, Scissors, Settings, Sun, Users, WandSparkles } from 'lucide-react';
 import { useState, type ReactNode } from 'react';
-import { setState, toast, useStore } from '../store';
+import { setState, useStore } from '../store';
 import { go, openSettings, setNav, useNav, type PageId } from '../nav';
 import { DictionaryIcon, Glyph, InsightsIcon, NotetakerIcon, ScratchpadIcon, StyleIcon } from './icons';
 import { useClickOutside } from './ui';
@@ -74,8 +74,8 @@ export function TitleBar() {
             <button className="menu-item" onClick={() => (setPop(null), openSettings('billing'))}>
               Plans and Billing
             </button>
-            <button className="menu-item" onClick={() => (setPop(null), toast('Signing out is disabled in this local build'))}>
-              Sign out
+            <button className="menu-item" onClick={() => (setPop(null), setNav({ modal: 'shortcuts' }))}>
+              Shortcuts
             </button>
           </div>
         )}
@@ -170,7 +170,7 @@ export function Sidebar() {
           <li>
             <button className="nav-item" onClick={() => setNav({ modal: 'referral' })}>
               <Gift size={18} />
-              <span className="nav-label">Get a free month</span>
+              <span className="nav-label">Share Roy Flow</span>
             </button>
           </li>
           <li>

@@ -1,76 +1,182 @@
-import { useEffect, useMemo, useState } from 'react';
-import { ArrowLeft, ArrowUp, ArrowUpRight, CalendarDays, ChevronDown, ChevronUp, FileText, Folder, FolderPlus, Search, Settings, Trash2, X } from 'lucide-react';
-import { setSetting, setState, toast, uid, useStore, type Meeting } from '../store';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { ArrowLeft, ArrowUp, ArrowUpRight, CalendarDays, ChevronDown, ChevronUp, FileText, Folder, MessageSquare, Plus, RotateCw, Search, Settings, Trash2, X } from 'lucide-react';
+import { setSetting, setState, toast, uid, useStore, type Chat, type ChatMessage, type Meeting } from '../store';
 import { openSettings } from '../nav';
 import { Confirm, Tabs } from '../components/ui';
 import { NotetakerIcon } from '../components/icons';
+import { native } from '../native/bridge';
+import { useCalendar } from '../settings/SettingsModal';
+import { useShortcutLabel } from '../settings/ShortcutsEditor';
+import type { MeetingStatus } from '../shared/ipc';
 
 const dayKey = (ts: number) => new Date(ts).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
 const time = (ts: number) => new Date(ts).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }).toLowerCase();
 const weekday = (ts: number) => new Date(ts).toLocaleDateString('en-US', { weekday: 'long' });
+const clock = (s: number) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+
+/** live Notetaker state from the main process */
+function useMeetingStatus(): MeetingStatus {
+  const [st, setSt] = useState<MeetingStatus>({ recording: false, startedAt: 0, title: '', partial: '', segments: [] });
+  useEffect(() => {
+    if (!native) return;
+    return native.on('meeting:status', (s) => {
+      setSt(s);
+      if (s.error) toast(s.error, { tone: 'error' });
+    });
+  }, []);
+  return st;
+}
+
+function SummaryStatus({ m }: { m: Meeting }) {
+  const [busy, setBusy] = useState(false);
+  const regen = async () => {
+    if (!native) return;
+    setBusy(true);
+    const r = await native.invoke('meeting:summarize', { id: m.id });
+    setBusy(false);
+    if (!r.ok) toast(r.error ?? 'Could not summarise', { tone: 'error' });
+  };
+  if (m.summaryStatus === 'pending' || busy) return <p className="muted">Claude is writing the summary…</p>;
+  if (m.summaryStatus === 'nokey')
+    return (
+      <p className="muted">
+        Add an Anthropic API key in{' '}
+        <button className="link" onClick={() => openSettings('account')}>
+          Settings › Account
+        </button>{' '}
+        to get a summary and action items.{' '}
+        {native && (
+          <button className="link" onClick={regen}>
+            Summarise now
+          </button>
+        )}
+      </p>
+    );
+  if (m.summaryStatus === 'error')
+    return (
+      <p style={{ color: 'var(--destructive)' }}>
+        {m.summaryError ?? 'The summary failed.'}{' '}
+        <button className="link" onClick={regen}>
+          Try again
+        </button>
+      </p>
+    );
+  return (
+    <>
+      <p>{m.overview || (m.transcript?.length ? 'No summary yet.' : 'Nothing was transcribed in this recording.')}</p>
+      {native && !!m.transcript?.length && (
+        <button className="btn btn-ghost btn-sm" style={{ alignSelf: 'flex-start', marginTop: 8 }} onClick={regen}>
+          <RotateCw size={14} /> Regenerate summary
+        </button>
+      )}
+    </>
+  );
+}
 
 export default function Notetaker() {
   const meetings = useStore((s) => s.meetings);
   const settings = useStore((s) => s.settings);
+  const chats = useStore((s) => s.chats);
+  const status = useMeetingStatus();
+  const shortcut = useShortcutLabel('notetaker');
+  const [cal, refreshCal] = useCalendar();
   const [tab, setTab] = useState<'past' | 'shared' | 'folders'>('past');
-  const [sel, setSel] = useState<string | null>(meetings[0]?.id ?? null);
+  const [sel, setSel] = useState<string | null>(null);
   const [open, setOpen] = useState<string | null>(null);
   const [q, setQ] = useState('');
   const [searching, setSearching] = useState(false);
-  const [rec, setRec] = useState<number | null>(null);
-  const [tick, setTick] = useState(0);
+  const [, setTick] = useState(0);
   const [ask, setAsk] = useState('');
-  const [answer, setAnswer] = useState<null | { q: string; hits: Meeting[] }>(null);
+  const [chatId, setChatId] = useState<string | null>(null);
+  const [streaming, setStreaming] = useState<{ id: string; text: string } | null>(null);
+  const [showChats, setShowChats] = useState(false);
   const [del, setDel] = useState<string | null>(null);
+  const [starting, setStarting] = useState(false);
+  const liveRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    if (rec === null) return;
+    if (!status.recording) return;
     const t = window.setInterval(() => setTick((x) => x + 1), 1000);
     return () => window.clearInterval(t);
-  }, [rec]);
+  }, [status.recording]);
+  useEffect(() => {
+    liveRef.current?.scrollTo({ top: liveRef.current.scrollHeight });
+  }, [status.segments.length, status.partial]);
+  useEffect(() => {
+    if (!native) return;
+    return native.on('ai:chunk', ({ id, delta }) => setStreaming((s) => (s && s.id === id ? { id, text: s.text + delta } : s)));
+  }, []);
 
   const list = useMemo(
     () =>
       meetings
-        .filter((m) => (tab === 'shared' ? m.shared : !m.shared))
-        .filter((m) => !q || (m.title + m.overview).toLowerCase().includes(q.toLowerCase()))
+        .filter((m) => !m.shared)
+        .filter((m) => !q || [m.title, m.overview, m.thoughts ?? '', ...(m.transcript ?? []).map((x) => x.text)].join(' ').toLowerCase().includes(q.toLowerCase()))
         .sort((a, b) => b.ts - a.ts),
-    [meetings, tab, q],
+    [meetings, q],
   );
   const groups = useMemo(() => {
     const g = new Map<string, Meeting[]>();
     list.forEach((m) => g.set(dayKey(m.ts), [...(g.get(dayKey(m.ts)) ?? []), m]));
     return [...g.entries()];
   }, [list]);
-  const current = meetings.find((m) => m.id === sel) ?? null;
+  const folders = useMemo(() => {
+    const f = new Map<string, number>();
+    meetings.forEach((m) => m.folder && f.set(m.folder, (f.get(m.folder) ?? 0) + 1));
+    return [...f.entries()];
+  }, [meetings]);
+  const current = meetings.find((m) => m.id === (sel ?? list[0]?.id)) ?? null;
+  const calConnected = !!(settings.connected_gcal || settings.connected_outlook) && cal?.status === 'authorized';
+  const now = Date.now();
+  const endOfDay = new Date().setHours(23, 59, 59, 999);
+  const todays = (cal?.events ?? []).filter((e) => !e.allDay && e.end > now && e.start < endOfDay);
 
-  const toggleRec = () => {
-    if (rec === null) {
-      setRec(Date.now());
-      setTick(0);
-      toast('Notetaker started');
-      return;
-    }
-    const mins = Math.max(1, Math.round((Date.now() - rec) / 60000));
-    const m: Meeting = { id: uid(), title: 'Untitled meeting', ts: rec, minutes: mins, people: 1, overview: 'Recorded locally. Add your own notes under My thoughts.' };
-    setState((s) => ({ meetings: [m, ...s.meetings], checklist: { ...s.checklist, try: true } }));
-    setRec(null);
-    setSel(m.id);
-    toast('Meeting note saved');
+  const start = async (title?: string) => {
+    if (!native) return toast('Notetaker records in the desktop app', { tone: 'error' });
+    setStarting(true);
+    const r = await native.invoke('meeting:start', { title });
+    setStarting(false);
+    if (!r.ok) toast(r.error ?? 'Could not start Notetaker', { tone: 'error' });
+  };
+  const toggleRec = async () => {
+    if (status.recording) {
+      await native?.invoke('meeting:stop');
+      toast('Meeting note saved');
+      setState((s) => ({ checklist: { ...s.checklist, try: true } }));
+    } else start();
   };
 
-  const submitAsk = () => {
-    if (!ask.trim()) return;
-    const words = ask.toLowerCase().split(/\W+/).filter((w) => w.length > 3);
-    const hits = meetings.filter((m) => words.some((w) => (m.title + ' ' + m.overview).toLowerCase().includes(w)));
-    setAnswer({ q: ask, hits });
+  const chat = chats.find((c) => c.id === chatId) ?? null;
+  const submitAsk = async () => {
+    const question = ask.trim();
+    if (!question || streaming) return;
+    if (!native) return toast('Ask runs in the desktop app', { tone: 'error' });
     setAsk('');
+    setShowChats(false);
+    let c: Chat = chat ?? { id: uid(), title: question.slice(0, 60), updated: Date.now(), messages: [] };
+    const messages: ChatMessage[] = [...c.messages, { role: 'user', content: question }];
+    c = { ...c, messages, updated: Date.now() };
+    setState((s) => ({ chats: [c, ...s.chats.filter((x) => x.id !== c.id)] }));
+    setChatId(c.id);
+    const reqId = uid();
+    setStreaming({ id: reqId, text: '' });
+    let text = '';
+    const off = native.on('ai:chunk', ({ id, delta }) => id === reqId && (text += delta));
+    const r = await native.invoke('ai:ask', { id: reqId, messages });
+    off();
+    setStreaming(null);
+    if (!r.ok && !text) {
+      toast(r.error ?? 'Claude could not answer', { tone: 'error' });
+      setState((s) => ({ chats: s.chats.map((x) => (x.id === c.id ? { ...x, messages: x.messages.slice(0, -1) } : x)).filter((x) => x.messages.length) }));
+      return;
+    }
+    setState((s) => ({ chats: s.chats.map((x) => (x.id === c.id ? { ...x, updated: Date.now(), messages: [...x.messages, { role: 'assistant', content: text }] } : x)) }));
   };
 
   const openMeeting = meetings.find((m) => m.id === open);
   if (openMeeting) return <MeetingDetail m={openMeeting} onBack={() => setOpen(null)} list={list} setOpen={setOpen} />;
 
-  const elapsed = rec !== null ? Math.floor((Date.now() - rec) / 1000) + tick * 0 : 0;
+  const elapsed = status.recording ? Math.floor((Date.now() - status.startedAt) / 1000) : 0;
 
   return (
     <main className="page nt-page">
@@ -81,15 +187,35 @@ export default function Notetaker() {
             <button className="icon-btn lg" data-tip="Open Notetaker settings" aria-label="Open Notetaker settings" onClick={() => openSettings('notetaker')}>
               <Settings size={20} />
             </button>
-            <button className={`btn ${rec !== null ? 'btn-primary' : 'btn-secondary'}`} onClick={toggleRec}>
+            <button className={`btn ${status.recording ? 'btn-primary' : 'btn-secondary'}`} onClick={toggleRec} disabled={starting} data-tip={shortcut ? `Shortcut: ${shortcut}` : undefined}>
               <NotetakerIcon size={18} />
-              {rec !== null ? `Stop · ${Math.floor(elapsed / 60)}:${String(elapsed % 60).padStart(2, '0')}` : 'Start Notetaker'}
+              {status.recording ? `Stop · ${clock(elapsed)}` : starting ? 'Starting…' : 'Start Notetaker'}
             </button>
           </div>
         </header>
         <div className="nt-scroll">
           <div className="nt-content">
-            {!settings.notetakerAutoPromptDismissed && !settings.autoStartNotetaker && (
+            {status.recording && (
+              <section className="today-card nt-live">
+                <span className="caps">
+                  <span className="rec-dot" /> Recording · {status.title}
+                </span>
+                {settings.liveTranscript !== false ? (
+                  <div className="nt-live-body" ref={liveRef}>
+                    {status.segments.map((s, i) => (
+                      <p key={i}>
+                        <span className="muted small">{clock(s.t)}</span> {s.text}
+                      </p>
+                    ))}
+                    {status.partial && <p className="muted">{status.partial}</p>}
+                    {!status.segments.length && !status.partial && <p className="muted">Listening… words appear here as people speak.</p>}
+                  </div>
+                ) : (
+                  <p className="muted">Live transcript is hidden. Turn it on in Notetaker settings.</p>
+                )}
+              </section>
+            )}
+            {!settings.notetakerAutoPromptDismissed && !settings.autoStartNotetaker && calConnected && (
               <div className="notice">
                 <span className="notice-icon">
                   <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
@@ -99,7 +225,7 @@ export default function Notetaker() {
                 </span>
                 <div className="notice-text">
                   <b>Want Notetaker to start automatically?</b>
-                  <span className="muted">Notetaker will switch on as soon as a meeting starts</span>
+                  <span className="muted">Notetaker will switch on when a meeting on your calendar starts</span>
                 </div>
                 <div className="row-gap" style={{ gap: 8 }}>
                   <button className="btn btn-ghost" onClick={() => setSetting('notetakerAutoPromptDismissed', true)}>
@@ -119,15 +245,42 @@ export default function Notetaker() {
             )}
             <section className="today-card">
               <span className="caps">Today</span>
-              <div className="today-empty">
-                <CalendarDays size={40} strokeWidth={1.4} />
-                <div className="today-empty-title">{settings.connected_gcal || settings.connected_outlook ? 'No more meetings today' : 'No meetings found'}</div>
-                {!(settings.connected_gcal || settings.connected_outlook) && (
-                  <button className="btn btn-primary" onClick={() => openSettings('connectors')}>
-                    Connect calendar
-                  </button>
-                )}
-              </div>
+              {calConnected && todays.length ? (
+                <div className="nt-upcoming">
+                  {todays.map((e) => {
+                    const live = e.start <= now && e.end > now;
+                    return (
+                      <div key={e.id} className="nt-row" style={{ cursor: 'default' }}>
+                        <span className="nt-icon">
+                          <CalendarDays size={18} />
+                        </span>
+                        <div className="nt-row-text">
+                          <span className="nt-row-title">{e.title}</span>
+                          <span className="nt-row-meta">
+                            {live ? 'Now' : time(e.start)} – {time(e.end)}
+                            {e.calendar ? ` · ${e.calendar}` : ''}
+                          </span>
+                        </div>
+                        {!status.recording && (
+                          <button className="btn btn-outline btn-sm" onClick={() => start(e.title)}>
+                            Take notes
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : (
+                <div className="today-empty">
+                  <CalendarDays size={40} strokeWidth={1.4} />
+                  <div className="today-empty-title">{calConnected ? 'No more meetings today' : 'No calendar connected'}</div>
+                  {!calConnected && (
+                    <button className="btn btn-primary" onClick={() => (cal?.status === 'authorized' ? (setSetting('connected_gcal', true), refreshCal(false)) : openSettings('connectors'))}>
+                      Connect calendar
+                    </button>
+                  )}
+                </div>
+              )}
             </section>
             <div>
               <Tabs
@@ -142,7 +295,7 @@ export default function Notetaker() {
                   searching ? (
                     <div className="search-field">
                       <Search size={14} className="muted" />
-                      <input autoFocus placeholder="Search personal or shared notes..." value={q} onChange={(e) => setQ(e.target.value)} />
+                      <input autoFocus placeholder="Search notes and transcripts..." value={q} onChange={(e) => setQ(e.target.value)} />
                       <button aria-label="Clear" onClick={() => (setQ(''), setSearching(false))}>
                         <X size={14} className="muted" />
                       </button>
@@ -154,28 +307,27 @@ export default function Notetaker() {
                   )
                 }
               />
-              {tab === 'folders' ? (
+              {tab === 'shared' ? (
+                <div className="empty">Sharing is not available in the local build. Notes stay on this Mac.</div>
+              ) : tab === 'folders' ? (
                 <div className="nt-folders">
-                  {['Product', 'Personal'].map((f) => (
-                    <div key={f} className="nt-row">
+                  {folders.length === 0 && <div className="empty">No folders yet. Open a note and add it to a folder.</div>}
+                  {folders.map(([f, n]) => (
+                    <button key={f} className="nt-row" onClick={() => (setQ(''), setTab('past'), setSel(meetings.find((m) => m.folder === f)?.id ?? null))}>
                       <span className="nt-icon">
                         <Folder size={18} />
                       </span>
                       <div className="nt-row-text">
                         <span className="nt-row-title">{f}</span>
-                        <span className="muted small">{f === 'Product' ? '3 notes' : 'No notes in this folder yet'}</span>
+                        <span className="muted small">
+                          {n} note{n === 1 ? '' : 's'}
+                        </span>
                       </div>
-                    </div>
+                    </button>
                   ))}
-                  <button className="nt-row" onClick={() => toast('Folders are kept locally in this build')}>
-                    <span className="nt-icon">
-                      <FolderPlus size={18} />
-                    </span>
-                    <span className="nt-row-title">Create folder</span>
-                  </button>
                 </div>
               ) : groups.length === 0 ? (
-                <div className="empty">{q ? `No notes found for "${q}"` : 'No meeting notes'}</div>
+                <div className="empty">{q ? `No notes found for "${q}"` : `No meeting notes yet. Click Start Notetaker${shortcut ? ` or press ${shortcut}` : ''} when a meeting begins.`}</div>
               ) : (
                 groups.map(([day, ms]) => (
                   <div key={day} className="nt-day">
@@ -185,7 +337,7 @@ export default function Notetaker() {
                         key={m.id}
                         role="button"
                         tabIndex={0}
-                        className={`nt-row ${sel === m.id ? 'selected' : ''}`}
+                        className={`nt-row ${current?.id === m.id ? 'selected' : ''}`}
                         onClick={() => setSel(m.id)}
                         onDoubleClick={() => setOpen(m.id)}
                         onKeyDown={(e) => e.key === 'Enter' && setOpen(m.id)}
@@ -194,8 +346,12 @@ export default function Notetaker() {
                           <FileText size={18} strokeWidth={1.6} />
                         </span>
                         <div className="nt-row-text">
-                          <span className="nt-row-title">{m.title}</span>
-                          <span className="nt-row-meta">{time(m.ts)}</span>
+                          <span className="nt-row-title">
+                            {m.title} {m.demo && <span className="badge">Demo</span>}
+                          </span>
+                          <span className="nt-row-meta">
+                            {time(m.ts)} · {m.minutes} min{m.summaryStatus === 'pending' ? ' · summarising…' : ''}
+                          </span>
                         </div>
                         <div className="row-actions" style={{ padding: 0 }}>
                           <button className="icon-btn" data-tip="Delete meeting" aria-label="Delete meeting" onClick={(e) => (e.stopPropagation(), setDel(m.id))}>
@@ -211,31 +367,55 @@ export default function Notetaker() {
             <div style={{ height: 110 }} />
           </div>
         </div>
-        {answer && (
-          <div className="ask-answer">
-            <button className="icon-btn" style={{ float: 'right' }} aria-label="Close answer" onClick={() => setAnswer(null)}>
-              <X size={16} />
-            </button>
-            <div className="caps muted">You asked</div>
-            <p style={{ marginBottom: 8 }}>{answer.q}</p>
-            {answer.hits.length ? (
-              <>
-                <p>
-                  Found {answer.hits.length} related note{answer.hits.length > 1 ? 's' : ''}:
-                </p>
-                <ul>
-                  {answer.hits.map((m) => (
-                    <li key={m.id}>
-                      <button className="link" onClick={() => (setSel(m.id), setAnswer(null))}>
-                        {m.title}
-                      </button>{' '}
-                      <span className="muted">({dayKey(m.ts)})</span>
-                    </li>
-                  ))}
-                </ul>
-              </>
+        {(chat || showChats) && (
+          <div className="ask-answer nt-chat">
+            <div className="row-gap" style={{ justifyContent: 'space-between', marginBottom: 8 }}>
+              <span className="caps muted">{showChats ? 'Past chats' : chat?.title}</span>
+              <span className="row-gap" style={{ gap: 4 }}>
+                {chat && !showChats && (
+                  <button className="icon-btn" data-tip="New chat" aria-label="New chat" onClick={() => setChatId(null)}>
+                    <Plus size={16} />
+                  </button>
+                )}
+                <button className="icon-btn" aria-label="Close" onClick={() => (setChatId(null), setShowChats(false))}>
+                  <X size={16} />
+                </button>
+              </span>
+            </div>
+            {showChats ? (
+              chats.length ? (
+                <div className="nt-chat-list">
+                  {[...chats]
+                    .sort((a, b) => b.updated - a.updated)
+                    .map((c) => (
+                      <div key={c.id} className="nt-row" role="button" tabIndex={0} onClick={() => (setChatId(c.id), setShowChats(false))}>
+                        <span className="nt-icon">
+                          <MessageSquare size={16} />
+                        </span>
+                        <div className="nt-row-text">
+                          <span className="nt-row-title">{c.title}</span>
+                          <span className="nt-row-meta">
+                            {dayKey(c.updated)} · {c.messages.length} messages
+                          </span>
+                        </div>
+                        <button className="icon-btn" aria-label="Delete chat" onClick={(e) => (e.stopPropagation(), setState((s) => ({ chats: s.chats.filter((x) => x.id !== c.id) })))}>
+                          <Trash2 size={14} />
+                        </button>
+                      </div>
+                    ))}
+                </div>
+              ) : (
+                <p className="muted">No past chats yet.</p>
+              )
             ) : (
-              <p className="muted">Nothing in your notes matches that yet.</p>
+              <div className="nt-chat-body">
+                {chat?.messages.map((m, i) => (
+                  <div key={i} className={`nt-msg ${m.role}`}>
+                    {m.content}
+                  </div>
+                ))}
+                {streaming && <div className="nt-msg assistant">{streaming.text || <span className="muted">Thinking…</span>}</div>}
+              </div>
             )}
           </div>
         )}
@@ -247,13 +427,13 @@ export default function Notetaker() {
               submitAsk();
             }}
           >
-            <input value={ask} onChange={(e) => setAsk(e.target.value)} placeholder="Ask anything about your meetings, or type / for Skills" aria-label="Ask" />
+            <input value={ask} onChange={(e) => setAsk(e.target.value)} placeholder={chat ? 'Ask a follow-up…' : 'Ask anything about your meetings'} aria-label="Ask" disabled={!!streaming} />
             {ask ? (
               <button className="ask-send" aria-label="Ask">
                 <ArrowUp size={16} />
               </button>
             ) : (
-              <button type="button" className="ask-pill" onClick={() => toast('No past chats yet')}>
+              <button type="button" className="ask-pill" onClick={() => (setShowChats(!showChats), setChatId(null))}>
                 Past chats <ArrowUpRight size={14} />
               </button>
             )}
@@ -266,7 +446,7 @@ export default function Notetaker() {
             <div className="nt-panel-head">
               <h2>{current.title}</h2>
               <span className="muted">
-                {weekday(current.ts)} • {time(current.ts)}
+                {weekday(current.ts)} • {time(current.ts)} • {current.minutes} min
               </span>
               <button className="btn btn-outline btn-sm" style={{ alignSelf: 'flex-start', marginTop: 12 }} onClick={() => setOpen(current.id)}>
                 Open note
@@ -274,7 +454,19 @@ export default function Notetaker() {
             </div>
             <div className="nt-panel-body">
               <div className="caps muted">Overview</div>
-              <p>{current.overview}</p>
+              <SummaryStatus m={current} />
+              {!!current.actionItems?.length && (
+                <>
+                  <div className="caps muted" style={{ marginTop: 16 }}>
+                    Action items
+                  </div>
+                  <ul>
+                    {current.actionItems.map((a, i) => (
+                      <li key={i}>{a}</li>
+                    ))}
+                  </ul>
+                </>
+              )}
             </div>
           </>
         ) : (
@@ -299,11 +491,17 @@ export default function Notetaker() {
 
 function MeetingDetail({ m, onBack, list, setOpen }: { m: Meeting; onBack: () => void; list: Meeting[]; setOpen: (id: string) => void }) {
   const [tab, setTab] = useState<'thoughts' | 'summary' | 'transcript'>('summary');
-  const [thoughts, setThoughts] = useState(() => localStorage.getItem(`roy-flow-thoughts-${m.id}`) ?? '');
+  const [thoughts, setThoughts] = useState(m.thoughts ?? '');
+  const [folder, setFolder] = useState(m.folder ?? '');
   const i = list.findIndex((x) => x.id === m.id);
+  const patch = (p: Partial<Meeting>) => setState((s) => ({ meetings: s.meetings.map((x) => (x.id === m.id ? { ...x, ...p } : x)) }));
+  useEffect(() => {
+    setThoughts(m.thoughts ?? '');
+    setFolder(m.folder ?? '');
+  }, [m.id]);
   useEffect(() => {
     const k = (e: KeyboardEvent) => {
-      if ((e.target as HTMLElement).tagName === 'TEXTAREA') return;
+      if (['TEXTAREA', 'INPUT'].includes((e.target as HTMLElement).tagName)) return;
       if (e.key === 'Escape') onBack();
       if (e.key === 'j' && list[i - 1]) setOpen(list[i - 1].id);
       if (e.key === 'k' && list[i + 1]) setOpen(list[i + 1].id);
@@ -326,9 +524,19 @@ function MeetingDetail({ m, onBack, list, setOpen }: { m: Meeting; onBack: () =>
           </button>
         </div>
       </div>
-      <h2 className="nt-l2-title">{m.title}</h2>
-      <div className="muted" style={{ padding: '0 8px 12px' }}>
-        {dayKey(m.ts)} · {time(m.ts)} · {m.minutes} min · {m.people} people
+      <input className="nt-l2-title nt-title-input" value={m.title} onChange={(e) => patch({ title: e.target.value })} aria-label="Meeting title" />
+      <div className="muted row-gap" style={{ padding: '0 8px 12px', gap: 8 }}>
+        {dayKey(m.ts)} · {time(m.ts)} · {m.minutes} min
+        <span style={{ flex: 1 }} />
+        <Folder size={14} />
+        <input
+          className="nt-folder-input"
+          placeholder="Add to folder"
+          value={folder}
+          onChange={(e) => setFolder(e.target.value)}
+          onBlur={() => patch({ folder: folder.trim() || undefined })}
+          onKeyDown={(e) => e.key === 'Enter' && (e.target as HTMLInputElement).blur()}
+        />
       </div>
       <div className="nt-l2-card">
         <div className="pill-tabs">
@@ -347,26 +555,32 @@ function MeetingDetail({ m, onBack, list, setOpen }: { m: Meeting; onBack: () =>
         {tab === 'summary' && (
           <div className="nt-l2-body">
             <div className="caps muted">Overview</div>
-            <p>{m.overview}</p>
-            <div className="caps muted" style={{ marginTop: 16 }}>
-              Action items
-            </div>
-            <ul>
-              <li>Share the notes with everyone who attended</li>
-              <li>Follow up on open questions before the next sync</li>
-            </ul>
+            <SummaryStatus m={m} />
+            {!!m.actionItems?.length && (
+              <>
+                <div className="caps muted" style={{ marginTop: 16 }}>
+                  Action items
+                </div>
+                <ul>
+                  {m.actionItems.map((a, k) => (
+                    <li key={k}>{a}</li>
+                  ))}
+                </ul>
+              </>
+            )}
           </div>
         )}
         {tab === 'transcript' && (
           <div className="nt-l2-body">
-            <p>
-              <b>Speaker 1</b> <span className="muted">0:00</span>
-            </p>
-            <p>Thanks everyone for joining. Let's start with a quick round of updates.</p>
-            <p style={{ marginTop: 12 }}>
-              <b>Speaker 2</b> <span className="muted">0:14</span>
-            </p>
-            <p>{m.overview}</p>
+            {m.transcript?.length ? (
+              m.transcript.map((s, k) => (
+                <p key={k} style={{ marginBottom: 10 }}>
+                  <span className="muted small">{clock(s.t)}</span> {s.text}
+                </p>
+              ))
+            ) : (
+              <p className="muted">{m.demo ? 'Demo notes have no transcript.' : 'No transcript was recorded.'}</p>
+            )}
           </div>
         )}
         {tab === 'thoughts' && (
@@ -376,7 +590,7 @@ function MeetingDetail({ m, onBack, list, setOpen }: { m: Meeting; onBack: () =>
             value={thoughts}
             onChange={(e) => {
               setThoughts(e.target.value);
-              localStorage.setItem(`roy-flow-thoughts-${m.id}`, e.target.value);
+              patch({ thoughts: e.target.value });
             }}
           />
         )}

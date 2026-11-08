@@ -12,5 +12,9 @@
 	<string>Roy Flow listens to your microphone while you dictate.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>Roy Flow turns your speech into text, on this Mac when supported.</string>
+	<key>NSCalendarsUsageDescription</key>
+	<string>Roy Flow shows your upcoming meetings on the Notetaker page and in the menu bar.</string>
+	<key>NSCalendarsFullAccessUsageDescription</key>
+	<string>Roy Flow shows your upcoming meetings on the Notetaker page and in the menu bar.</string>
 </dict>
 </plist>

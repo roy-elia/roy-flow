@@ -12,6 +12,7 @@ import Style from './pages/Style';
 import Transforms from './pages/Transforms';
 import Scratchpad, { ScratchpadWindow } from './pages/Scratchpad';
 import SettingsModal from './settings/SettingsModal';
+import ShortcutsDialog from './settings/ShortcutsEditor';
 import FlowBar from './flowbar/FlowBar';
 import HubBridge from './native/HubBridge';
 import AccessBanner from './native/AccessBanner';
@@ -45,6 +46,7 @@ export default function App() {
       <SettingsModal />
       {modal === 'help' && <HelpDialog />}
       {modal === 'referral' && <ReferralDialog />}
+      {modal === 'shortcuts' && <ShortcutsDialog onClose={() => setNav({ modal: null })} />}
       <Toasts />
     </div>
   );
@@ -84,31 +86,30 @@ function HelpDialog() {
 }
 
 function ReferralDialog() {
-  const link = 'https://roy-flow.local/invite/FRIEND1';
+  const text = 'I dictate with Roy Flow: hold a key, talk, and clean text lands in any app. It runs on my Mac.';
   return (
-    <Dialog title="Share Roy Flow with a friend" subtitle="Send your invite link. When a friend starts dictating, you both get a month of extras." onClose={() => setNav({ modal: null })} width={512}>
+    <Dialog title="Share Roy Flow" subtitle="Roy Flow is a local app with no accounts or referral rewards. Copy a short note to tell a friend about it." onClose={() => setNav({ modal: null })} width={512}>
       <div className="referral-card">
         <div className="caps" style={{ letterSpacing: '.14em', fontSize: 10 }}>
-          Unlimited access for 1 month
+          Dictation for your Mac
         </div>
         <div className="serif" style={{ fontSize: 34, lineHeight: '36px' }}>
           Roy <em>Flow</em>
         </div>
       </div>
       <div className="url-field">
-        <span>{link}</span>
+        <span>{text}</span>
         <button
           className="icon-btn"
-          aria-label="Copy link"
+          aria-label="Copy"
           onClick={() => {
-            navigator.clipboard?.writeText(link);
-            toast('Invite link copied');
+            navigator.clipboard?.writeText(text);
+            toast('Copied');
           }}
         >
           <Copy size={18} />
         </button>
       </div>
-      <p className="small muted">Rewards are applied automatically (in a real deployment).</p>
     </Dialog>
   );
 }

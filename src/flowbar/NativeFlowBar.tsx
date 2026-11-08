@@ -4,7 +4,8 @@ import { useEffect, useRef, useState } from 'react';
 import { Mic, Square, WandSparkles, X } from 'lucide-react';
 import { native } from '../native/bridge';
 import { NotetakerIcon, ScratchpadIcon } from '../components/icons';
-import type { DictationPhase, FlowBarConfig } from '../shared/ipc';
+import { diffWords } from '../shared/textPipeline';
+import type { DictationPhase, FlowBarConfig, TransformChange } from '../shared/ipc';
 
 type Look = 'resting' | 'ready' | 'recording' | 'processing';
 interface Note {
@@ -12,19 +13,27 @@ interface Note {
   tone?: 'error';
 }
 const BARS = 10;
+const withKey = (text: string, key: string) => (key ? `${text} (${key})` : text);
 
 export default function NativeFlowBar() {
-  const [cfg, setCfg] = useState<FlowBarConfig>({ show: true, dock: 'bottom', scratchpadInBar: true, transformsOptIn: true, shortcutLabel: '⌥ Space', sounds: true });
+  const [cfg, setCfg] = useState<FlowBarConfig>({
+    show: true,
+    dock: 'bottom',
+    scratchpadInBar: true,
+    transformsOptIn: true,
+    labels: { ptt: 'fn', handsfree: '⌥ Space', cancel: 'Esc', notetaker: '⌥M', scratchpad: '', viewChanges: '⌥O' },
+    meeting: false,
+    creatorMode: false,
+  });
   const [phase, setPhase] = useState<DictationPhase>('idle');
+  const [kindLabel, setKindLabel] = useState('');
   const [hover, setHover] = useState(false);
   const [interim, setInterim] = useState('');
   const [levels, setLevels] = useState<number[]>(Array(BARS).fill(0.15));
   const [note, setNote] = useState<Note | null>(null);
   const [tip, setTip] = useState<string | null>(null);
+  const [changes, setChanges] = useState<TransformChange | null>(null);
   const noteTimer = useRef(0);
-  const phaseRef = useRef(phase);
-  const cfgRef = useRef(cfg);
-  cfgRef.current = cfg;
 
   const notify = (n: Note, ms = 4000) => {
     setNote(n);
@@ -42,25 +51,30 @@ export default function NativeFlowBar() {
     const offs = [
       native.on('flowbar:config', setCfg),
       native.on('dictation:status', (s) => {
-        const prev = phaseRef.current;
-        phaseRef.current = s.phase;
         setPhase(s.phase);
         setInterim(s.interim ?? '');
-        if (s.phase === 'recording' && prev !== 'recording') {
+        setKindLabel(s.kind === 'transform' ? (s.label ?? 'Transform') : '');
+        if (s.phase === 'recording') {
           setNote(null);
-          if (cfgRef.current.sounds) beep(660);
+          setChanges(null);
         }
         if (s.phase !== 'recording') setLevels(Array(BARS).fill(0.15));
-        if (s.phase === 'error' && s.error) notify({ text: s.error, tone: 'error' });
+        if (s.phase === 'error' && s.error) notify({ text: s.error, tone: 'error' }, 5000);
       }),
       native.on('dictation:level', (v) => {
         // scroll the waveform: newest level enters on the right, with a little per-bar jitter
         setLevels((l) => [...l.slice(1), Math.max(0.15, Math.min(1, v * (0.75 + Math.random() * 0.5)))]);
       }),
       native.on('dictation:result', (r) => {
-        if (cfgRef.current.sounds) beep(880);
-        const short = r.text.length > 48 ? r.text.slice(0, 48) + '…' : r.text;
-        notify(r.pasted ? { text: `Pasted: “${short}”` } : { text: r.reason ?? 'Copied to the clipboard' }, r.pasted ? 3000 : 6000);
+        const t = r.item.text;
+        const short = t.length > 48 ? t.slice(0, 48) + '…' : t;
+        if (r.note) notify({ text: r.note, tone: 'error' }, 6000);
+        else notify(r.pasted ? { text: `Pasted: “${short}”` } : { text: r.reason ?? 'Copied to the clipboard' }, r.pasted ? 3000 : 6000);
+      }),
+      native.on('flowbar:note', (n) => notify(n, n.tone === 'error' ? 6000 : 4000)),
+      native.on('flowbar:changes', (c) => {
+        setNote(null);
+        setChanges(c);
       }),
     ];
     native.send('flowbar:ready');
@@ -97,16 +111,38 @@ export default function NativeFlowBar() {
   const look: Look = phase === 'recording' ? 'recording' : phase === 'processing' ? 'processing' : hover ? 'ready' : 'resting';
   const side = cfg.dock !== 'bottom';
   const toggle = () => native?.send('dictation:toggle');
-  const open = (page: string) => native?.send('hub:open', { page });
+  const L = cfg.labels;
 
   return (
     <div className={`flowbar-host dock-${cfg.dock}`}>
-      {note && (
+      {changes && (
+        <div className="fb-changes" data-interactive role="dialog" aria-label="Transform changes">
+          <div className="fb-changes-head">
+            <b>{changes.name}</b>
+            <span className="fb-changes-legend">
+              <span className="del">removed</span> <span className="add">added</span>
+            </span>
+            <button className="fb-round" aria-label="Close" onClick={() => setChanges(null)}>
+              <X size={12} strokeWidth={3} />
+            </button>
+          </div>
+          <div className="fb-changes-body">
+            {diffWords(changes.before, changes.after).map((d, i) => (
+              <span key={i} className={d.type}>
+                {d.text}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+      {note && !changes && (
         <div className={`fb-note ${note.tone === 'error' ? 'error' : ''}`} role="status" data-interactive onClick={() => setNote(null)}>
           <span>{note.text}</span>
         </div>
       )}
       {phase === 'recording' && interim && <div className="fb-live">{interim}</div>}
+      {phase === 'recording' && cfg.creatorMode && !interim && <div className="fb-tip">Dictating with Roy Flow</div>}
+      {phase === 'processing' && kindLabel && <div className="fb-tip">Running {kindLabel}…</div>}
       {tip && (look === 'ready' || look === 'recording') && <div className="fb-tip">{tip}</div>}
       <div
         className="fb-hot"
@@ -117,12 +153,14 @@ export default function NativeFlowBar() {
           setTip(null);
         }}
       >
-        <div className={`fb-pill ${look}`} data-state={look}>
+        <div className={`fb-pill ${look} ${cfg.meeting && look === 'resting' ? 'meeting' : ''}`} data-state={look}>
           {look === 'ready' && (
             <button
               className="fb-mic"
               aria-label="Dictate"
-              onMouseEnter={() => setTip(`Click or press ${cfg.shortcutLabel} to dictate`)}
+              onMouseEnter={() =>
+                setTip(L.ptt ? `Click, or hold ${L.ptt} to dictate${L.handsfree ? ` · ${L.handsfree} hands-free` : ''}` : L.handsfree ? `Click or press ${L.handsfree} to dictate` : 'Click to dictate')
+              }
               onMouseLeave={() => setTip(null)}
               onClick={() => {
                 setTip(null);
@@ -133,7 +171,7 @@ export default function NativeFlowBar() {
             </button>
           )}
           {look === 'recording' && (
-            <button className="fb-round" aria-label="Cancel" onMouseEnter={() => setTip('Cancel (Esc)')} onMouseLeave={() => setTip(null)} onClick={() => native?.send('dictation:cancel')}>
+            <button className="fb-round" aria-label="Cancel" onMouseEnter={() => setTip(withKey('Cancel', L.cancel))} onMouseLeave={() => setTip(null)} onClick={() => native?.send('dictation:cancel')}>
               <X size={12} strokeWidth={3} />
             </button>
           )}
@@ -146,23 +184,29 @@ export default function NativeFlowBar() {
           )}
           {look === 'processing' && <span className="fb-spinner" aria-label="Processing" />}
           {look === 'recording' && (
-            <button className="fb-round" aria-label="Finish" onMouseEnter={() => setTip('Finish and paste')} onMouseLeave={() => setTip(null)} onClick={toggle}>
+            <button className="fb-round" aria-label="Finish" onMouseEnter={() => setTip(withKey('Finish and paste', L.handsfree))} onMouseLeave={() => setTip(null)} onClick={toggle}>
               <Square size={9} fill="currentColor" strokeWidth={0} />
             </button>
           )}
         </div>
         {look === 'ready' && (
           <div className="fb-pickers">
-            <button className="fb-disc" aria-label="Start Notetaker" onMouseEnter={() => setTip('Start Notetaker')} onMouseLeave={() => setTip(null)} onClick={() => open('notetaker')}>
+            <button
+              className={`fb-disc ${cfg.meeting ? 'live' : ''}`}
+              aria-label={cfg.meeting ? 'Stop Notetaker' : 'Start Notetaker'}
+              onMouseEnter={() => setTip(withKey(cfg.meeting ? 'Stop Notetaker' : 'Start Notetaker', L.notetaker))}
+              onMouseLeave={() => setTip(null)}
+              onClick={() => native?.send('meeting:toggle')}
+            >
               <NotetakerIcon size={14} />
             </button>
             {cfg.scratchpadInBar && (
-              <button className="fb-disc" aria-label="Scratchpad" onMouseEnter={() => setTip('Scratchpad')} onMouseLeave={() => setTip(null)} onClick={() => open('scratchpad')}>
+              <button className="fb-disc" aria-label="Scratchpad" onMouseEnter={() => setTip(withKey('Scratchpad', L.scratchpad))} onMouseLeave={() => setTip(null)} onClick={() => native?.send('scratchpad:open')}>
                 <ScratchpadIcon size={14} />
               </button>
             )}
             {cfg.transformsOptIn && (
-              <button className="fb-disc" aria-label="Transforms" onMouseEnter={() => setTip('Transforms')} onMouseLeave={() => setTip(null)} onClick={() => open('transforms')}>
+              <button className="fb-disc" aria-label="Transforms" onMouseEnter={() => setTip('Transforms: select text, then press a Transform shortcut')} onMouseLeave={() => setTip(null)} onClick={() => native?.send('hub:open', { page: 'transforms' })}>
                 <WandSparkles size={14} />
               </button>
             )}
@@ -171,22 +215,4 @@ export default function NativeFlowBar() {
       </div>
     </div>
   );
-}
-
-function beep(freq: number) {
-  try {
-    const ctx = new AudioContext();
-    const o = ctx.createOscillator();
-    const g = ctx.createGain();
-    o.frequency.value = freq;
-    g.gain.setValueAtTime(0.0001, ctx.currentTime);
-    g.gain.exponentialRampToValueAtTime(0.06, ctx.currentTime + 0.01);
-    g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.18);
-    o.connect(g).connect(ctx.destination);
-    o.start();
-    o.stop(ctx.currentTime + 0.2);
-    o.onended = () => ctx.close();
-  } catch {
-    /* no audio */
-  }
 }

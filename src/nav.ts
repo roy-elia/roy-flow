@@ -19,7 +19,7 @@ export interface Nav {
   /** open Scratchpad editor window; null = closed, '' = new note */
   noteId: string | null;
   insightsTab: 'usage' | 'voice';
-  modal: null | 'help' | 'referral' | 'notifications' | 'account';
+  modal: null | 'help' | 'referral' | 'notifications' | 'account' | 'shortcuts';
 }
 
 const PAGES: PageId[] = ['home', 'notetaker', 'insights', 'dictionary', 'snippets', 'style', 'transforms', 'scratchpad'];

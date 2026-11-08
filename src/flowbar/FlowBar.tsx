@@ -159,14 +159,11 @@ export default function FlowBar() {
         used = t.name;
       }
     }
-    const minutes = Math.max((Date.now() - startedAt.current) / 60000, 0.05);
+    const durationMs = Date.now() - startedAt.current;
     const words = wordCount(text);
-    const item: HistoryItem = { id: uid(), ts: Date.now(), text, original: raw, status: 'ok', app: 'Roy Flow' };
+    const item: HistoryItem = { id: uid(), ts: Date.now(), text, original: raw, status: 'ok', app: 'Roy Flow', words, durationMs };
     const intoNote = appendToOpenNote(text);
-    setState((st) => ({
-      history: [item, ...st.history],
-      totals: { ...st.totals, words: st.totals.words + words, wpm: Math.round((st.totals.wpm * 9 + Math.min(220, words / minutes)) / 10) },
-    }));
+    setState((st) => ({ history: [item, ...st.history] }));
     navigator.clipboard?.writeText(text).catch(() => {});
     if (getState().settings.sounds) beep(880);
     setBar('resting');

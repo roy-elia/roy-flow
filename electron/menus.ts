@@ -1,13 +1,29 @@
 /* Tray (menu-bar) menu and macOS application menu, adapted from analysis/wispr-flow/UI_MENUBAR.md §2, §3 and §6. */
 import { Menu, type MenuItemConstructorOptions } from 'electron';
-import { DEFAULT_MIC, LANGUAGES, type NavRequest, type StateSnapshot } from '../src/shared/ipc';
+import { DEFAULT_MIC, LANGUAGES, type CalEvent, type NavRequest } from '../src/shared/ipc';
+
+/** what the menus show; built by main from the data store */
+export interface MenuSnapshot {
+  settings: Record<string, string | boolean>;
+  lastTranscript: string;
+  totalWords: number;
+  dictionaryCount: number;
+  snippetCount: number;
+  pastNotes: { id: string; title: string; ts: number }[];
+}
 
 export interface MenuContext {
-  snap: StateSnapshot;
+  snap: MenuSnapshot;
   devices: string[];
   dev: boolean;
+  /** Electron accelerators for the user's shortcuts (display only) */
+  acc: { handsfree?: string; pasteLast?: string; copyLast?: string; notetaker?: string; scratchpad?: string; openApp?: string };
+  upcoming: CalEvent[] | null;
+  meetingActive: boolean;
   openHub(nav?: NavRequest): void;
   toggleDictation(): void;
+  toggleMeeting(): void;
+  openScratchpad(): void;
   pasteLast(): void;
   copyLast(): void;
   checkUpdates(): void;
@@ -51,21 +67,36 @@ function lastTranscriptPreview(c: MenuContext): MenuItemConstructorOptions[] {
   return t ? [{ label: truncate(t, 25), toolTip: truncate(t, 270), enabled: false }] : [];
 }
 
+const accel = (a?: string): Partial<MenuItemConstructorOptions> => (a ? { accelerator: a, registerAccelerator: false } : {});
+
+function upcomingItems(c: MenuContext): MenuItemConstructorOptions[] {
+  if (!c.upcoming) return [{ label: 'Connect your calendar…', click: () => c.openHub({ settings: 'connectors' }) }];
+  const now = Date.now();
+  const next = c.upcoming.filter((e) => e.end > now && !e.allDay).slice(0, 6);
+  const items: MenuItemConstructorOptions[] = next.map((e) => ({ label: truncate(e.title, 40), sublabel: fmtDate(e.start), click: () => c.openHub({ page: 'notetaker' }) }));
+  if (!items.length) items.push({ label: 'No upcoming meetings', enabled: false });
+  items.push({ type: 'separator' }, { label: 'See all upcoming meetings', click: () => c.openHub({ page: 'notetaker' }) });
+  return items;
+}
+
 export function buildTrayMenu(c: MenuContext): Menu {
   const hasLast = !!c.snap.lastTranscript.trim();
   const t: MenuItemConstructorOptions[] = [
-    { label: 'See all upcoming meetings', click: () => c.openHub({ page: 'notetaker' }) },
+    { label: 'Upcoming meetings', submenu: upcomingItems(c) },
     { label: 'Past notes', submenu: pastNotes(c) },
     { type: 'separator' },
-    { label: 'Start Notetaker', click: () => c.openHub({ page: 'notetaker' }) },
-    { label: 'Open Roy Flow', click: () => c.openHub({ page: 'home' }) },
+    { label: c.meetingActive ? 'Stop Notetaker' : 'Start Notetaker', ...accel(c.acc.notetaker), click: c.toggleMeeting },
+    { label: 'Start dictation', ...accel(c.acc.handsfree), click: c.toggleDictation },
+    { label: 'Open Scratchpad', ...accel(c.acc.scratchpad), click: c.openScratchpad },
+    { label: 'Open Roy Flow', ...accel(c.acc.openApp), click: () => c.openHub({ page: 'home' }) },
     { type: 'separator' },
     { label: 'Check for updates...', click: c.checkUpdates },
     { type: 'separator' },
-    { label: 'Paste last transcript', accelerator: 'Control+Command+V', registerAccelerator: false, enabled: hasLast, click: c.pasteLast },
+    { label: 'Paste last transcript', ...accel(c.acc.pasteLast), enabled: hasLast, click: c.pasteLast },
+    { label: 'Copy last transcript', ...accel(c.acc.copyLast), enabled: hasLast, click: c.copyLast },
     ...lastTranscriptPreview(c),
     { type: 'separator' },
-    { label: 'Shortcuts', click: () => c.openHub({ settings: 'general' }) },
+    { label: 'Shortcuts', click: () => c.openHub({ settings: 'general', modal: 'shortcuts' }) },
     { label: 'Microphone', submenu: micItems(c) },
     { label: 'Languages', submenu: languageItems(c) },
     { type: 'separator' },
@@ -99,8 +130,9 @@ export function buildAppMenu(c: MenuContext): Menu {
     {
       label: 'File',
       submenu: [
-        { label: 'Start dictation', click: c.toggleDictation },
-        { label: 'Start Notetaker', click: () => c.openHub({ page: 'notetaker' }) },
+        { label: 'Start dictation', ...accel(c.acc.handsfree), click: c.toggleDictation },
+        { label: c.meetingActive ? 'Stop Notetaker' : 'Start Notetaker', ...accel(c.acc.notetaker), click: c.toggleMeeting },
+        { label: 'Open Scratchpad', ...accel(c.acc.scratchpad), click: c.openScratchpad },
         { type: 'separator' },
         { role: 'close', label: 'Close window' },
       ],
@@ -114,7 +146,8 @@ export function buildAppMenu(c: MenuContext): Menu {
       submenu: [
         { label: `Words dictated: ${c.snap.totalWords.toLocaleString('en-US')}`, click: () => c.openHub({ page: 'insights' }) },
         { type: 'separator' },
-        { label: 'Copy last transcript', enabled: hasLast, click: c.copyLast },
+        { label: 'Paste last transcript', ...accel(c.acc.pasteLast), enabled: hasLast, click: c.pasteLast },
+        { label: 'Copy last transcript', ...accel(c.acc.copyLast), enabled: hasLast, click: c.copyLast },
         ...lastTranscriptPreview(c),
         { type: 'separator' },
         { label: 'Microphone', submenu: micItems(c) },
@@ -124,8 +157,8 @@ export function buildAppMenu(c: MenuContext): Menu {
     {
       label: 'Notetaker',
       submenu: [
-        { label: 'Start Notetaker', click: () => c.openHub({ page: 'notetaker' }) },
-        { label: 'See all upcoming meetings', click: () => c.openHub({ page: 'notetaker' }) },
+        { label: c.meetingActive ? 'Stop Notetaker' : 'Start Notetaker', ...accel(c.acc.notetaker), click: c.toggleMeeting },
+        { label: 'Upcoming meetings', submenu: upcomingItems(c) },
         { label: 'Past notes', submenu: pastNotes(c) },
         { type: 'separator' },
         { label: 'Open Notetaker', click: () => c.openHub({ page: 'notetaker' }) },
@@ -152,7 +185,7 @@ export function buildAppMenu(c: MenuContext): Menu {
         { label: 'Help center', click: () => c.openHub({ modal: 'help' }) },
         { label: 'Talk to support', accelerator: 'Command+/', click: () => c.openHub({ modal: 'help' }) },
         { label: 'Share feedback', click: () => c.openHub({ modal: 'help' }) },
-        { label: 'Shortcuts', click: () => c.openHub({ settings: 'general' }) },
+        { label: 'Shortcuts', click: () => c.openHub({ settings: 'general', modal: 'shortcuts' }) },
       ],
     },
     { label: 'Window', role: 'window', submenu: [{ role: 'minimize' }, { role: 'close', label: 'Close Window' }] },

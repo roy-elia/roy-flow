@@ -1,6 +1,9 @@
-import { useMemo, useState } from 'react';
-import { Copy, EllipsisVertical, FileAudio, Flag, Pause, Play, Redo2, RotateCw, Search, Trash2, Undo2, X } from 'lucide-react';
-import { applyDictionaryAndSnippets, cleanUp, setState, toast, useStore, type HistoryItem } from '../store';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { Copy, EllipsisVertical, FileAudio, Flag, Pause, Pencil, Play, Redo2, RotateCw, Search, Trash2, Undo2, X } from 'lucide-react';
+import { applyDictionaryAndSnippets, cleanUp, getState, setState, toast, uid, useStats, useStore, type HistoryItem } from '../store';
+import { correctedWords, wordCount } from '../shared/textPipeline';
+import { native } from '../native/bridge';
+import { useShortcutLabel } from '../settings/ShortcutsEditor';
 import { go, setNav } from '../nav';
 import { Confirm, Dialog, Hero, MenuButton, PageFrame } from '../components/ui';
 
@@ -24,7 +27,9 @@ export function compact(n: number) {
 export default function Home() {
   const user = useStore((s) => s.user);
   const history = useStore((s) => s.history);
-  const totals = useStore((s) => s.totals);
+  const totals = useStats();
+  const ptt = useShortcutLabel('ptt');
+  const hands = useShortcutLabel('handsfree');
   const [q, setQ] = useState('');
   const [searching, setSearching] = useState(false);
   const [selected, setSelected] = useState<string | null>(null);
@@ -53,7 +58,7 @@ export default function Home() {
   };
 
   return (
-    <PageFrame title={`Welcome back, ${user.firstName}`} maxWidth={1046}>
+    <PageFrame title={user.firstName ? `Welcome back, ${user.firstName}` : 'Welcome back'} maxWidth={1046}>
       <div className="home-columns">
         <div className="home-primary">
           <Hero
@@ -83,7 +88,12 @@ export default function Home() {
                 </div>
                 <div className="empty-card">
                   <div className="empty-title">{q ? `No transcripts found for "${q}"` : 'No dictations yet'}</div>
-                  {!q && <p className="muted">Click the Flow Bar at the bottom of the window and start talking.</p>}
+                  {!q && (
+                    <p className="muted">
+                      {ptt ? `Hold ${ptt} and speak in any app` : 'Click the Flow Bar at the bottom of the screen and start talking'}
+                      {hands ? `, or press ${hands} for hands-free` : ''}. Your dictations show up here.
+                    </p>
+                  )}
                 </div>
               </>
             )}
@@ -149,10 +159,22 @@ function copyText(t: string) {
   );
 }
 
+let currentAudio: HTMLAudioElement | null = null;
+
 function HistoryRow({ h, selected, onSelect }: { h: HistoryItem; selected: boolean; onSelect: () => void }) {
   const [dialog, setDialog] = useState<null | 'delete' | 'report'>(null);
   const [playing, setPlaying] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(h.text);
+  const [busy, setBusy] = useState(false);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
   const update = (patch: Partial<HistoryItem>) => setState((s) => ({ history: s.history.map((x) => (x.id === h.id ? { ...x, ...patch } : x)) }));
+  useEffect(
+    () => () => {
+      audioRef.current?.pause();
+    },
+    [],
+  );
 
   if (h.status === 'dismissed')
     return (
@@ -167,14 +189,32 @@ function HistoryRow({ h, selected, onSelect }: { h: HistoryItem; selected: boole
       </div>
     );
 
-  const play = () => {
-    const synth = window.speechSynthesis;
-    if (!synth) return toast('Audio playback is unavailable in this browser', { tone: 'error' });
+  const play = async () => {
     if (playing) {
-      synth.cancel();
+      audioRef.current?.pause();
+      window.speechSynthesis?.cancel();
       setPlaying(false);
       return;
     }
+    if (native) {
+      if (!h.audio) return toast('No audio was kept for this dictation', { tone: 'error' });
+      const bytes = await native.invoke('audio:get', { file: h.audio });
+      if (!bytes) return toast('The audio for this dictation was removed to save space', { tone: 'error' });
+      currentAudio?.pause();
+      const url = URL.createObjectURL(new Blob([bytes as BlobPart], { type: 'audio/wav' }));
+      const a = new Audio(url);
+      audioRef.current = a;
+      currentAudio = a;
+      a.onended = a.onpause = () => {
+        setPlaying(false);
+        URL.revokeObjectURL(url);
+      };
+      setPlaying(true);
+      a.play().catch(() => setPlaying(false));
+      return;
+    }
+    const synth = window.speechSynthesis;
+    if (!synth) return toast('Audio playback is unavailable in this browser', { tone: 'error' });
     synth.cancel();
     const u = new SpeechSynthesisUtterance(h.text);
     u.onend = () => setPlaying(false);
@@ -182,13 +222,66 @@ function HistoryRow({ h, selected, onSelect }: { h: HistoryItem; selected: boole
     synth.speak(u);
   };
 
-  const aiEdited = h.original !== undefined;
-  const undone = aiEdited && h.text === h.original;
+  const hasRaw = h.original !== undefined && h.original !== (h.cleaned ?? h.text);
+  const undone = h.original !== undefined && h.cleaned !== undefined && h.text === h.original;
+
+  const saveEdit = () => {
+    const next = draft.trim();
+    setEditing(false);
+    if (!next || next === h.text) return;
+    update({ text: next, cleaned: undefined, words: wordCount(next) });
+    if (!getState().settings.autoAddDictionary) return toast('Transcript updated');
+    const known = new Set(getState().dictionary.map((d) => d.word.toLowerCase()));
+    const add = correctedWords(h.text, next).filter((w) => !known.has(w.word.toLowerCase()));
+    if (!add.length) return toast('Transcript updated');
+    setState((s) => ({ dictionary: [...add.map((w) => ({ id: uid(), word: w.word, misspelling: w.misspelling, scope: 'personal' as const, created: Date.now(), auto: true })), ...s.dictionary] }));
+    toast(`Added ${add.map((w) => `“${w.word}”`).join(', ')} to your dictionary`);
+  };
+
+  const retry = async () => {
+    if (native) {
+      setBusy(true);
+      const r = await native.invoke('ai:cleanup', { id: h.id });
+      setBusy(false);
+      if (!r.ok) return toast(r.error ?? 'Retry failed', { tone: 'error' });
+      return toast(r.error ?? 'Transcript retried', r.error ? { tone: 'error' } : {});
+    }
+    update({ text: cleanUp(applyDictionaryAndSnippets(h.original ?? h.text)) });
+    toast('Transcript retried');
+  };
 
   return (
     <div className={`row hrow ${selected ? 'selected' : ''}`} onClick={onSelect}>
       <div className="h-time">{fmtTime(h.ts)}</div>
-      <div className="h-text">{h.text}</div>
+      {editing ? (
+        <div className="h-text h-edit" onClick={(e) => e.stopPropagation()}>
+          <textarea
+            className="field"
+            autoFocus
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) saveEdit();
+              if (e.key === 'Escape') (setEditing(false), setDraft(h.text));
+              e.stopPropagation();
+            }}
+          />
+          <div className="row-gap" style={{ gap: 8 }}>
+            <button className="btn btn-primary btn-sm" onClick={saveEdit}>
+              Save
+            </button>
+            <button className="btn btn-ghost btn-sm" onClick={() => (setEditing(false), setDraft(h.text))}>
+              Cancel
+            </button>
+            <span className="small muted">⌘↩ to save</span>
+          </div>
+        </div>
+      ) : (
+        <div className={`h-text ${busy ? 'muted' : ''}`} onDoubleClick={() => (setDraft(h.text), setEditing(true))}>
+          {busy ? 'Retrying…' : h.text}
+          {h.app && <span className="h-app small muted"> · {h.app}</span>}
+        </div>
+      )}
       <div className="row-actions">
         <button className="icon-btn lg" data-tip={playing ? 'Pause audio' : 'Play audio'} aria-label="Play audio" onClick={play}>
           {playing ? <Pause size={20} strokeWidth={1.8} /> : <Play size={20} strokeWidth={1.8} />}
@@ -196,7 +289,7 @@ function HistoryRow({ h, selected, onSelect }: { h: HistoryItem; selected: boole
         <button className="icon-btn lg" data-tip="Copy transcript" aria-label="Copy transcript" onClick={() => copyText(h.text)}>
           <Copy size={20} strokeWidth={1.8} />
         </button>
-        <button className={`icon-btn lg ${h.flagged ? 'active' : ''}`} data-tip="Send feedback" aria-label="Send feedback" onClick={() => setDialog('report')}>
+        <button className={`icon-btn lg ${h.flagged ? 'active' : ''}`} data-tip={h.flagged ? 'Flagged' : 'Flag this transcript'} aria-label="Flag transcript" onClick={() => (h.flagged ? (update({ flagged: false }), toast('Flag removed')) : setDialog('report'))}>
           <Flag size={20} strokeWidth={1.8} />
         </button>
         <MenuButton
@@ -205,36 +298,26 @@ function HistoryRow({ h, selected, onSelect }: { h: HistoryItem; selected: boole
           tip="More options"
           trigger={<EllipsisVertical size={20} strokeWidth={1.8} />}
           items={[
+            { label: 'Edit transcript', icon: <Pencil size={18} />, run: () => (setDraft(h.text), setEditing(true)) },
             {
               label: undone ? 'Redo AI edit' : 'Undo AI edit',
               icon: undone ? <Redo2 size={18} /> : <Undo2 size={18} />,
               run: () => {
-                if (!aiEdited) {
-                  update({ original: h.text, text: h.text });
-                  return toast('No AI edit to undo on this transcript');
-                }
-                update({ text: undone ? cleanUp(applyDictionaryAndSnippets(h.original!)) : h.original! });
+                if (undone) return update({ text: h.cleaned!, cleaned: undefined });
+                if (!hasRaw) return toast('No AI edit to undo on this transcript');
+                update({ cleaned: h.text, text: h.original! });
               },
             },
-            {
-              label: 'Retry transcript',
-              icon: <RotateCw size={18} />,
-              run: () => {
-                update({ text: cleanUp(applyDictionaryAndSnippets(h.original ?? h.text)) });
-                toast('Transcript retried');
-              },
-            },
+            { label: 'Retry transcript', icon: <RotateCw size={18} />, run: () => void retry() },
             { label: 'Delete transcript', icon: <Trash2 size={18} />, danger: true, run: () => setDialog('delete') },
             {
               label: 'Extract audio',
               icon: <FileAudio size={18} />,
-              run: () => {
-                const blob = new Blob([h.text], { type: 'text/plain' });
-                const a = document.createElement('a');
-                a.href = URL.createObjectURL(blob);
-                a.download = `transcript-${h.id}.txt`;
-                a.click();
-                toast('Audio is not stored locally, so the transcript was saved instead');
+              run: async () => {
+                if (!native) return toast('Audio is only kept by the desktop app', { tone: 'error' });
+                if (!h.audio) return toast('No audio was kept for this dictation', { tone: 'error' });
+                const r = await native.invoke('audio:extract', { file: h.audio, name: `Roy Flow ${new Date(h.ts).toISOString().slice(0, 16).replace(':', '-')}` });
+                if (r.ok) toast(`Saved ${r.path}`);
               },
             },
           ]}
@@ -243,7 +326,7 @@ function HistoryRow({ h, selected, onSelect }: { h: HistoryItem; selected: boole
       {dialog === 'delete' && (
         <Confirm
           title="Are you sure you want to delete this transcript?"
-          subtitle="Once deleted it cannot be recovered"
+          subtitle="The transcript and its audio are deleted from this Mac and cannot be recovered"
           onClose={() => setDialog(null)}
           onConfirm={() => {
             setState((s) => ({ history: s.history.filter((x) => x.id !== h.id) }));
@@ -260,8 +343,8 @@ function ReportDialog({ onClose, onSend }: { onClose: () => void; onSend: () => 
   const [text, setText] = useState('');
   return (
     <Dialog
-      title="Report to improve the model"
-      subtitle="Thanks for flagging this. Tell us what you expected so the transcript can get better."
+      title="Flag this transcript"
+      subtitle="Flagged transcripts are marked on Home so you can find them later. If a word keeps coming out wrong, add it to your dictionary."
       onClose={onClose}
       actions={
         <button
@@ -269,14 +352,14 @@ function ReportDialog({ onClose, onSend }: { onClose: () => void; onSend: () => 
           onClick={() => {
             onSend();
             onClose();
-            toast('Report saved locally');
+            toast('Transcript flagged');
           }}
         >
-          Send feedback
+          Flag
         </button>
       }
     >
-      <textarea className="field" style={{ width: 460 }} placeholder="Describe what you expected instead" value={text} onChange={(e) => setText(e.target.value)} />
+      <textarea className="field" style={{ width: 460 }} placeholder="Optional note: what did you expect?" value={text} onChange={(e) => setText(e.target.value)} />
     </Dialog>
   );
 }

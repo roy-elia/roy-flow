@@ -1974,3 +1974,239 @@ mark {
     padding: 16px 24px;
   }
 }
+
+/* ------------------------------------------------------------------ Shortcuts editor */
+.sc-list {
+  display: flex;
+  flex-direction: column;
+  max-height: 440px;
+  overflow-y: auto;
+  margin: 0 -8px;
+  padding: 0 8px;
+}
+.sc-row {
+  display: flex;
+  gap: 24px;
+  padding: 14px 0;
+  border-top: 1px solid var(--border);
+}
+.sc-row:first-child {
+  border-top: 0;
+}
+.sc-label {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.sc-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+}
+.sc-title .badge {
+  font-weight: 500;
+}
+.sc-desc {
+  font-size: 12px;
+  line-height: 20px;
+  color: var(--foreground-secondary, var(--neutral-500));
+  max-width: 260px;
+}
+.sc-error {
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--destructive);
+  max-width: 300px;
+}
+.sc-fields {
+  width: 300px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.sc-field-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.sc-input {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 44px;
+  padding: 0 10px 0 6px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--card);
+  cursor: pointer;
+  text-align: left;
+}
+.sc-input:hover:not(:disabled) {
+  border-color: var(--neutral-400, var(--border));
+}
+.sc-input.recording {
+  border-color: #a88ed5;
+  box-shadow: 0 0 0 3px rgba(168, 142, 213, 0.18);
+}
+.sc-input:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+.sc-chips {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.sc-placeholder {
+  padding-left: 6px;
+  font-size: 12px;
+  line-height: 20px;
+  color: var(--neutral-400, var(--neutral-500));
+}
+.sc-edit {
+  color: var(--neutral-500);
+  opacity: 0;
+}
+.sc-input:hover .sc-edit {
+  opacity: 1;
+}
+.sc-spacer {
+  width: 32px;
+  flex: none;
+}
+.sc-row-tools {
+  display: flex;
+  gap: 4px;
+}
+.sc-row-tools:empty {
+  display: none;
+}
+.sc-note {
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: var(--background-tertiary, var(--sand-500));
+  font-size: 13px;
+  line-height: 20px;
+}
+.sc-note.error {
+  background: color-mix(in srgb, var(--destructive) 10%, transparent);
+}
+.sc-footer {
+  display: flex;
+  justify-content: space-between;
+  width: 100%;
+}
+
+/* Scratchpad in its own window */
+.sp-standalone {
+  height: 100vh;
+  background: var(--popover);
+}
+.sp-window.standalone {
+  position: static;
+  width: 100%;
+  height: 100vh;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  animation: none;
+}
+.sp-window.standalone .sp-win-bar {
+  padding-left: 78px;
+  -webkit-app-region: drag;
+}
+.sp-window.standalone .sp-win-bar button,
+.sp-window.standalone .sp-win-tab {
+  -webkit-app-region: no-drag;
+}
+.h-edit {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.h-edit textarea {
+  min-height: 72px;
+  resize: vertical;
+}
+.h-app {
+  white-space: nowrap;
+}
+
+/* Notetaker: live transcript, upcoming meetings, chat */
+.nt-live .caps {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.rec-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #e5484d;
+  animation: rec-pulse 1.4s infinite;
+}
+@keyframes rec-pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+.nt-live-body {
+  max-height: 220px;
+  overflow-y: auto;
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.nt-live.today-card {
+  padding-bottom: 16px;
+}
+.nt-upcoming {
+  display: flex;
+  flex-direction: column;
+  margin-top: 8px;
+}
+.nt-chat {
+  max-height: 55vh;
+  display: flex;
+  flex-direction: column;
+}
+.nt-chat-body,
+.nt-chat-list {
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.nt-msg {
+  white-space: pre-wrap;
+  line-height: 22px;
+}
+.nt-msg.user {
+  align-self: flex-end;
+  max-width: 80%;
+  padding: 8px 12px;
+  border-radius: 14px;
+  background: var(--background-tertiary);
+}
+.nt-title-input {
+  border: 0;
+  background: transparent;
+  width: 100%;
+  font: inherit;
+  color: inherit;
+  outline: none;
+}
+.nt-folder-input {
+  border: 0;
+  background: transparent;
+  font: inherit;
+  color: inherit;
+  width: 140px;
+  outline: none;
+}
