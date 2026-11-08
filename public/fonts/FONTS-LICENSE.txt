@@ -1,0 +1,10 @@
+Roy Flow bundles the following fonts in public/fonts/. All are licensed under the
+SIL Open Font License, Version 1.1 (https://openfontlicense.org/open-font-license-official-text/).
+
+- Figtree (UI typeface) - Copyright The Figtree Project Authors (Erik Kennedy)
+- EB Garamond (display headings) - Copyright The EB Garamond Project Authors (Georg Duffner, Octavio Pardo)
+- Google Sans Code (monospace / key caps) - Copyright Google LLC
+
+The fonts are redistributed unmodified. They may be used, studied, modified and
+redistributed freely, but may not be sold on their own. Reserved Font Names, if
+any, apply to modified versions.
