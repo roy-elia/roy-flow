@@ -14,6 +14,8 @@ export interface HistoryItem {
   original?: string;
   status: 'ok' | 'dismissed';
   flagged?: boolean;
+  /** the note written when flagging */
+  flagNote?: string;
   app?: string;
   bundleId?: string;
   category?: AppCategory;

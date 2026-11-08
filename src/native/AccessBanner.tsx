@@ -3,7 +3,7 @@ import { ShieldAlert } from 'lucide-react';
 import { native } from './bridge';
 import type { AccessStatus } from '../shared/ipc';
 
-/** live permission state from the main process (polled every few seconds while mounted) */
+/** live permission state: one check on mount, then pushed by main (which polls every 5 s while the hub is open) */
 export function useAccess(): AccessStatus | null {
   const [a, setA] = useState<AccessStatus | null>(null);
   useEffect(() => {
@@ -15,11 +15,9 @@ export function useAccess(): AccessStatus | null {
         .then((x) => alive && setA(x))
         .catch(() => {});
     check();
-    const t = window.setInterval(check, 4000);
     const off = native.on('access:changed', (x) => setA(x));
     return () => {
       alive = false;
-      window.clearInterval(t);
       off();
     };
   }, []);

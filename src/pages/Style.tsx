@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { getNav, setNav } from '../nav';
 import { setSetting, setState, useStore } from '../store';
 import { Hero, PageFrame, Tabs } from '../components/ui';
 
@@ -31,7 +32,11 @@ export function styleText(t: string, style: string) {
 }
 
 export default function Style() {
-  const [tab, setTab] = useState<TabId>('personal');
+  const [tab, setTab] = useState<TabId>(() => {
+    const t = getNav().styleTab as TabId | undefined;
+    if (t) setNav({ styleTab: undefined });
+    return t ?? 'personal';
+  });
   const styles = useStore((s) => s.styles);
   const level = useStore((s) => s.settings.autoCleanup as string);
   const opts = tab === 'personal' ? OPTIONS : OPTIONS.filter((o) => o.id !== 'very');

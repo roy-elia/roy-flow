@@ -1,7 +1,8 @@
 import { useSyncExternalStore } from 'react';
-import { defaultSettings, defaultTransforms, LEGACY_DEMO_IDS } from './seed';
+import { LEGACY_DEMO_IDS } from './seed';
+import { emptyState, mergeState, retainHistory } from './shared/state';
 import { applyDictionaryAndSnippets as applyShared, cleanUp, wordCount } from './shared/textPipeline';
-import { defaultHotkeyMap, normalize, type HotkeyMap } from './shared/hotkeys';
+import { normalize, type HotkeyMap } from './shared/hotkeys';
 import { native } from './native/bridge';
 import type { HistoryItem, State } from './shared/types';
 
@@ -10,37 +11,8 @@ export type { AppCategory, Chat, ChatMessage, DictWord, HistoryItem, Meeting, No
 /** where the browser build (and the pre-1.1 desktop app) kept everything */
 const LEGACY_KEY = 'roy-flow-state-v1';
 
-export function emptyState(): State {
-  const transforms = defaultTransforms();
-  return {
-    theme: 'light',
-    sidebarOpen: true,
-    user: { firstName: '', lastName: '', email: '' },
-    history: [],
-    dictionary: [],
-    snippets: [],
-    notes: [],
-    meetings: [],
-    transforms,
-    chats: [],
-    hotkeys: defaultHotkeyMap(transforms),
-    voiceProfile: null,
-    dismissed: {},
-    checklist: {},
-    settings: defaultSettings(),
-    styles: { personal: 'casual', work: 'formal', email: 'formal', other: 'formal' },
-    announced: {},
-  };
-}
-
-function merge(base: State, saved: Partial<State>): State {
-  const s = { ...base, ...saved, settings: { ...base.settings, ...(saved.settings || {}) }, styles: { ...base.styles, ...(saved.styles || {}) } };
-  s.hotkeys = { ...defaultHotkeyMap(s.transforms), ...(saved.hotkeys || {}) };
-  s.chats = s.chats ?? [];
-  s.announced = s.announced ?? {};
-  s.voiceProfile = s.voiceProfile ?? null;
-  return s;
-}
+export { emptyState };
+const merge = mergeState;
 
 /** Electron accelerator ("Control+Alt+K") -> chord */
 function accToChord(acc: string): string[] {
@@ -79,10 +51,18 @@ function notify() {
 }
 
 /** send changed top-level keys to the main process (desktop) or localStorage (browser) */
+function flushNow() {
+  if (!pendingKeys.size) return;
+  window.clearTimeout(saveTimer);
+  flush();
+}
 function persist(keys: (keyof State)[]) {
   keys.forEach((k) => pendingKeys.add(k));
   window.clearTimeout(saveTimer);
-  saveTimer = window.setTimeout(() => {
+  saveTimer = window.setTimeout(flush, 150);
+}
+function flush() {
+  {
     if (native) {
       const patch: Record<string, unknown> = {};
       pendingKeys.forEach((k) => (patch[k] = state[k]));
@@ -95,7 +75,7 @@ function persist(keys: (keyof State)[]) {
       }
     }
     pendingKeys.clear();
-  }, 150);
+  }
 }
 
 /** load persisted data before the first render. Desktop: the JSON store in app data (migrating localStorage once). */
@@ -136,11 +116,11 @@ export async function hydrate(): Promise<void> {
       /* ignore corrupt storage */
     }
   }
-  // retention: "Auto-delete after 30 days"
-  if (state.settings.localStorage === 'Auto-delete after 30 days') {
-    const cutoff = Date.now() - 30 * 86400_000;
-    if (state.history.some((h) => h.ts < cutoff)) setState((s) => ({ history: s.history.filter((h) => h.ts >= cutoff) }));
-  }
+  // retention: "Auto-delete after 30 days" (main also applies it daily)
+  const kept = retainHistory(state.history, state.settings.localStorage);
+  if (kept) setState({ history: kept });
+  // flush pending changes when the window closes (the hub window is destroyed when closed, to free memory)
+  window.addEventListener('pagehide', flushNow);
 }
 
 export function getState() {
@@ -261,5 +241,5 @@ export function useToasts() {
 /* ------------------------------------------------------------------ text pipeline (shared with Electron main) */
 export { cleanUp, wordCount };
 export function applyDictionaryAndSnippets(text: string, s: State = state): string {
-  return applyShared(text, s.dictionary, s.snippets);
+  return applyShared(text, s.dictionary, s.snippets, { first: s.user.firstName, last: s.user.lastName, email: s.user.email });
 }

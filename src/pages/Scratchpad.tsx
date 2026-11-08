@@ -13,7 +13,6 @@ import {
   PinOff,
   Plus,
   Quote,
-  RefreshCw,
   Search,
   SquarePen,
   Trash2,
@@ -43,7 +42,6 @@ export default function Scratchpad() {
   const inBar = useStore((s) => s.settings.scratchpadInBar as boolean);
   const shortcut = useShortcutLabel('scratchpad');
   const [q, setQ] = useState('');
-  const [spin, setSpin] = useState(false);
   const [del, setDel] = useState<Note | null>(null);
   const list = useMemo(
     () =>
@@ -108,17 +106,6 @@ export default function Scratchpad() {
             <SearchToggle value={q} onChange={setQ} placeholder="Search your notes" />
             <button className="icon-btn" data-tip="New note" aria-label="New note" onClick={() => open(newNote())}>
               <Plus size={20} className="muted" />
-            </button>
-            <button
-              className="icon-btn"
-              data-tip="Refresh"
-              aria-label="Refresh"
-              onClick={() => {
-                setSpin(true);
-                window.setTimeout(() => setSpin(false), 700);
-              }}
-            >
-              <RefreshCw size={18} className={`muted ${spin ? 'spin' : ''}`} />
             </button>
           </div>
         </div>

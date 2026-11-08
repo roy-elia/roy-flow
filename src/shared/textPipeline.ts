@@ -13,14 +13,20 @@ export function escapeRe(s: string) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+/** a phrase as a whole-word regex that also works for phrases starting or ending in symbols (C++, .NET, e-mail) */
+function phraseRe(phrase: string, suffix = ''): RegExp {
+  const body = escapeRe(phrase.trim()).replace(/\s+/g, '\\s+');
+  return new RegExp(`(?<![\\p{L}\\p{N}_])${body}(?![\\p{L}\\p{N}_])${suffix}`, 'giu');
+}
+
 /** dictionary replacements (fix misspellings and casing); returns the text and how many words changed */
 export function applyDictionary(text: string, dictionary: PipelineWord[]): { text: string; count: number } {
   let out = text;
   let count = 0;
-  for (const w of dictionary) {
-    const from = w.misspelling || w.word;
-    if (!from) continue;
-    out = out.replace(new RegExp(`\\b${escapeRe(from)}\\b`, 'gi'), (m) => {
+  // longest first, so "Roy Flow" wins over "Roy"
+  const words = [...dictionary].filter((w) => (w.misspelling || w.word)?.trim()).sort((x, y) => (y.misspelling || y.word).length - (x.misspelling || x.word).length);
+  for (const w of words) {
+    out = out.replace(phraseRe(w.misspelling || w.word), (m) => {
       if (m !== w.word) count++;
       return w.word;
     });
@@ -28,41 +34,96 @@ export function applyDictionary(text: string, dictionary: PipelineWord[]): { tex
   return { text: out, count };
 }
 
-export function applySnippets(text: string, snippets: PipelineSnippet[]): { text: string; count: number } {
+export interface SnippetVars {
+  name?: string;
+  first?: string;
+  last?: string;
+  email?: string;
+}
+
+/** fill {name} {first} {last} {email} {date} {time} placeholders in a snippet expansion */
+export function fillSnippet(expansion: string, vars: SnippetVars = {}, now = new Date()): string {
+  const v: Record<string, string> = {
+    name: vars.name ?? [vars.first, vars.last].filter(Boolean).join(' '),
+    first: vars.first ?? '',
+    last: vars.last ?? '',
+    email: vars.email ?? '',
+    date: now.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' }),
+    time: now.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }),
+  };
+  return expansion.replace(/\{(name|first|last|email|date|time)\}/gi, (m, k: string) => v[k.toLowerCase()] || m);
+}
+
+/** spoken snippet triggers -> expansions. A trigger said as its own sentence also takes its full stop with it. */
+export function applySnippets(text: string, snippets: PipelineSnippet[], vars?: SnippetVars): { text: string; count: number } {
   let out = text;
   let count = 0;
-  for (const sn of snippets) {
-    if (!sn.trigger) continue;
-    out = out.replace(new RegExp(`\\b${escapeRe(sn.trigger)}\\b[.!?]?`, 'gi'), () => {
+  const list = [...snippets].filter((s) => s.trigger?.trim()).sort((x, y) => y.trigger.length - x.trigger.length);
+  for (const sn of list) {
+    out = out.replace(phraseRe(sn.trigger, '[.!?]?'), () => {
       count++;
-      return sn.expansion;
+      return fillSnippet(sn.expansion, vars);
     });
   }
   return { text: out, count };
 }
 
 /** dictionary replacements, then snippet expansion */
-export function applyDictionaryAndSnippets(text: string, dictionary: PipelineWord[], snippets: PipelineSnippet[]): string {
-  return applySnippets(applyDictionary(text, dictionary).text, snippets).text;
+export function applyDictionaryAndSnippets(text: string, dictionary: PipelineWord[], snippets: PipelineSnippet[], vars?: SnippetVars): string {
+  return applySnippets(applyDictionary(text, dictionary).text, snippets, vars).text;
 }
 
-const FILLERS = /\b(um+|uh+|erm+|hmm+|you know,?|i mean,?|like,)\s*/gi;
+/* ------------------------------------------------------------------ rule-based clean-up (no API key, or the API failed) */
+
+/** sounds that are never words */
+const HESITATIONS = /(?<![\p{L}'])(?:u+m+|u+h+m*|e+r+m+|e+r+|a+h+|h+m+|m+h*m+)(?![\p{L}'])[,.]?\s*/giu;
+/** discourse fillers, only when set off by commas (so "do you know him" and "I like it" survive) */
+const COMMA_FILLERS = /(^|[,.!?]\s*|\s)(?:you know|i mean|like|basically|so yeah)\s*,\s*/giu;
+const TRAILING_FILLERS = /,?\s+(?:you know|i guess|or something)\s*([.!?]?)\s*$/iu;
+/** "the the", "I I": a repeated word is a stutter (kept: words that legitimately repeat) */
+const STUTTER = /(?<![\p{L}\p{N}])([\p{L}']+)(?:\s+\1)+(?![\p{L}\p{N}])/giu;
+const KEEP_REPEATS = new Set(['that', 'had', 'is', 'very', 'really', 'no', 'bye', 'so', 'ha', 'go']);
+/** "new line" / "new paragraph" said while dictating */
+const SPOKEN_BREAKS = /[,.]?\s*\b(new paragraph|new line|next line)\b[,.]?\s*/giu;
+
+function capitaliseSentences(t: string): string {
+  return t
+    .replace(/^(\s*)(\p{Ll})/u, (_m, sp: string, c: string) => sp + c.toUpperCase())
+    .replace(/([.!?]\s+|\n\s*)(\p{Ll})/gu, (_m, p: string, c: string) => p + c.toUpperCase())
+    .replace(/(?<![\p{L}'])i(?=$|[\s,.!?;:']|'(?:m|ll|d|ve|s)\b)/gu, 'I');
+}
 
 /** rule-based clean-up used when no Claude key is set (or the call fails). level: Light | Medium | High */
 export function cleanUp(text: string, level = 'Medium'): string {
-  let t = text.replace(FILLERS, '').replace(/\b(\w+) \1\b/gi, '$1').replace(/\s+/g, ' ').trim();
+  let t = text.replace(/\s+/g, ' ').trim();
+  t = t.replace(HESITATIONS, '');
+  t = t.replace(COMMA_FILLERS, (_m, lead: string) => (lead.includes(',') ? ' ' : lead));
+  t = t.replace(TRAILING_FILLERS, '$1');
+  t = t.replace(STUTTER, (m, w: string) => (KEEP_REPEATS.has(w.toLowerCase()) ? m : w));
+  t = t.replace(SPOKEN_BREAKS, (_m, cmd: string) => (cmd.toLowerCase() === 'new paragraph' ? '\n\n' : '\n'));
+  t = t
+    .replace(/[ \t]+([,.!?;:])/g, '$1')
+    .replace(/([,;:])(?=[^\s\d])/g, '$1 ')
+    .replace(/,\s*([.!?])/g, '$1')
+    .replace(/^[,.\s]+/, '')
+    .replace(/[ \t]{2,}/g, ' ')
+    .replace(/[ \t]*\n[ \t]*/g, '\n')
+    .trim();
   if (!t || level === 'Light') return t;
-  t = t.charAt(0).toUpperCase() + t.slice(1);
-  t = t.replace(/([.!?]\s+)([a-z])/g, (_m, p: string, c: string) => p + c.toUpperCase()).replace(/\bi\b/g, 'I');
-  if (!/[.!?…:]$/.test(t)) t += '.';
-  if (level === 'High') t = t.replace(/\b(basically|actually|literally|kind of|sort of|just)\s+/gi, '').replace(/\s+([,.!?])/g, '$1');
+  if (level === 'High') t = t.replace(/(?<![\p{L}])(?:basically|actually|literally|kind of|sort of|just)\s+/giu, '').replace(/\s+([,.!?])/g, '$1');
+  t = capitaliseSentences(t);
+  // full stop at the end of every paragraph that does not end in punctuation
+  t = t
+    .split('\n')
+    .map((line) => (line.trim() && !/[.!?…:;,)"'”’]$/.test(line.trim()) ? line.trimEnd() + '.' : line))
+    .join('\n');
   return t;
 }
 
 /** Style page choices applied without AI: formal | casual | very | excited */
 export function styleText(t: string, style: string) {
-  if (style === 'casual') return t.replace(/[.](?=\s|$)/g, '').replace(/,/g, '');
-  if (style === 'very') return t.replace(/[.](?=\s|$)/g, '').replace(/,/g, '').toLowerCase();
+  if (style === 'casual') return t.replace(/\.$/, ''); // caps, less punctuation: no final full stop
+  if (style === 'very') return t.replace(/\.$/, '').replace(/,(?=\s)/g, '').toLowerCase(); // no caps, less punctuation
   if (style === 'excited') return t.replace(/\.(?=\s|$)/g, '!');
   return t;
 }
@@ -70,8 +131,8 @@ export function styleText(t: string, style: string) {
 export const wordCount = (t: string) => (t.trim() ? t.trim().split(/\s+/).length : 0);
 
 /** the rule-based pass applied to a final transcript (no AI) */
-export function processTranscript(raw: string, dictionary: PipelineWord[], snippets: PipelineSnippet[], level = 'Medium') {
-  return applySnippets(cleanUp(applyDictionary(raw, dictionary).text, level), snippets).text;
+export function processTranscript(raw: string, dictionary: PipelineWord[], snippets: PipelineSnippet[], level = 'Medium', vars?: SnippetVars) {
+  return applySnippets(cleanUp(applyDictionary(raw, dictionary).text, level), snippets, vars).text;
 }
 
 /* ------------------------------------------------------------------ word diff */

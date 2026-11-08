@@ -37,7 +37,7 @@ export default function Home() {
   const groups = useMemo(() => {
     const items = [...history]
       .sort((a, b) => b.ts - a.ts)
-      .filter((h) => !q || h.text.toLowerCase().includes(q.toLowerCase()));
+      .filter((h) => !q || (q.toLowerCase() === 'flagged' ? !!h.flagged : `${h.text} ${h.flagNote ?? ''}`.toLowerCase().includes(q.toLowerCase())));
     const m = new Map<string, HistoryItem[]>();
     for (const h of items) {
       const k = dayLabel(h.ts);
@@ -289,7 +289,7 @@ function HistoryRow({ h, selected, onSelect }: { h: HistoryItem; selected: boole
         <button className="icon-btn lg" data-tip="Copy transcript" aria-label="Copy transcript" onClick={() => copyText(h.text)}>
           <Copy size={20} strokeWidth={1.8} />
         </button>
-        <button className={`icon-btn lg ${h.flagged ? 'active' : ''}`} data-tip={h.flagged ? 'Flagged' : 'Flag this transcript'} aria-label="Flag transcript" onClick={() => (h.flagged ? (update({ flagged: false }), toast('Flag removed')) : setDialog('report'))}>
+        <button className={`icon-btn lg ${h.flagged ? 'active' : ''}`} data-tip={h.flagged ? (h.flagNote ? `Flagged: ${h.flagNote.slice(0, 60)} (click to unflag)` : 'Flagged (click to unflag)') : 'Flag this transcript'} aria-label="Flag transcript" onClick={() => (h.flagged ? (update({ flagged: false, flagNote: undefined }), toast('Flag removed')) : setDialog('report'))}>
           <Flag size={20} strokeWidth={1.8} />
         </button>
         <MenuButton
@@ -334,23 +334,23 @@ function HistoryRow({ h, selected, onSelect }: { h: HistoryItem; selected: boole
           }}
         />
       )}
-      {dialog === 'report' && <ReportDialog onClose={() => setDialog(null)} onSend={() => update({ flagged: true })} />}
+      {dialog === 'report' && <ReportDialog onClose={() => setDialog(null)} onSend={(note) => update({ flagged: true, flagNote: note.trim() || undefined })} />}
     </div>
   );
 }
 
-function ReportDialog({ onClose, onSend }: { onClose: () => void; onSend: () => void }) {
+function ReportDialog({ onClose, onSend }: { onClose: () => void; onSend: (note: string) => void }) {
   const [text, setText] = useState('');
   return (
     <Dialog
       title="Flag this transcript"
-      subtitle="Flagged transcripts are marked on Home so you can find them later. If a word keeps coming out wrong, add it to your dictionary."
+      subtitle="The flag and your note are saved with the transcript. Search Home for “flagged” to list them. If a word keeps coming out wrong, add it to your dictionary."
       onClose={onClose}
       actions={
         <button
           className="btn btn-primary"
           onClick={() => {
-            onSend();
+            onSend(text);
             onClose();
             toast('Transcript flagged');
           }}

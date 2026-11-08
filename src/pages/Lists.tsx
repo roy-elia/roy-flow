@@ -1,5 +1,6 @@
-import { useMemo, useRef, useState, type ReactNode } from 'react';
-import { ArrowRight, ArrowUpDown, Pencil, RefreshCw, Star, Trash2, Users } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { setNav, useNav } from '../nav';
+import { ArrowRight, ArrowUpDown, Pencil, Star, Trash2 } from 'lucide-react';
 import { setState, toast, uid, useStore, type DictWord, type Scope, type Snippet } from '../store';
 import { Confirm, Dialog, Hero, MenuButton, PageFrame, SearchToggle, Switch, Tabs } from '../components/ui';
 
@@ -10,13 +11,10 @@ function useListChrome(placeholder: string, sorts: Sort[]) {
   const [tab, setTab] = useState<TabId>('all');
   const [q, setQ] = useState('');
   const [sort, setSort] = useState<Sort>('Newest first');
-  const [spin, setSpin] = useState(false);
   const tabs = (
     <Tabs
       tabs={[
         { id: 'all', label: 'All' },
-        { id: 'personal', label: 'Personal' },
-        { id: 'team', label: 'Shared with team' },
       ]}
       value={tab}
       onChange={setTab}
@@ -28,22 +26,22 @@ function useListChrome(placeholder: string, sorts: Sort[]) {
             trigger={<ArrowUpDown size={18} className="muted" />}
             items={sorts.map((s) => ({ label: s === sort ? `✓  ${s}` : s, run: () => setSort(s) }))}
           />
-          <button
-            className="icon-btn"
-            data-tip="Sync"
-            aria-label="Sync"
-            onClick={() => {
-              setSpin(true);
-              window.setTimeout(() => setSpin(false), 700);
-            }}
-          >
-            <RefreshCw size={18} className={`muted ${spin ? 'spin' : ''}`} />
-          </button>
         </>
       }
     />
   );
   return { tab, q, sort, tabs };
+}
+
+/** "Add a word" / "Create a snippet" from the menu bar opens the Add dialog */
+function useAddRequest(open: () => void) {
+  const add = useNav((n) => !!n.add);
+  useEffect(() => {
+    if (!add) return;
+    setNav({ add: false });
+    open();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [add]);
 }
 
 function sortItems<T extends { created: number; starred?: boolean }>(items: T[], sort: Sort, key: (t: T) => string) {
@@ -74,6 +72,7 @@ export function Dictionary() {
   const heroHidden = useStore((s) => s.dismissed.dictionaryHero);
   const { tab, q, sort, tabs } = useListChrome('Search your vocabulary', ['Starred first', 'Newest first', 'Oldest first', 'Alphabetical (A-Z)']);
   const [modal, setModal] = useState<null | { edit?: DictWord; preset?: string }>(null);
+  useAddRequest(() => setModal({}));
   const [del, setDel] = useState<DictWord | null>(null);
   const file = useRef<HTMLInputElement>(null);
 
@@ -160,20 +159,8 @@ export function Dictionary() {
                   ) : (
                     highlight(w.word, q)
                   )}
-                  {w.scope === 'team' && (
-                    <span data-tip="Shared with team" className="muted" style={{ marginLeft: 8 }}>
-                      <Users size={14} />
-                    </span>
-                  )}
                 </p>
                 <div className="row-actions">
-                  <button
-                    className="icon-btn"
-                    data-tip={w.scope === 'team' ? 'Make personal' : 'Share with team'}
-                    onClick={() => setState((s) => ({ dictionary: s.dictionary.map((x) => (x.id === w.id ? { ...x, scope: x.scope === 'team' ? 'personal' : 'team' } : x)) }))}
-                  >
-                    <Users size={16} />
-                  </button>
                   <button className="icon-btn" data-tip="Edit" onClick={() => setModal({ edit: w })}>
                     <Pencil size={16} />
                   </button>
@@ -220,7 +207,7 @@ function WordModal({ edit, preset, onClose }: { edit?: DictWord; preset?: string
   const [replace, setReplace] = useState(!!edit?.misspelling);
   const [mis, setMis] = useState(edit?.misspelling ?? '');
   const [word, setWord] = useState(edit?.word ?? preset ?? '');
-  const [team, setTeam] = useState(edit?.scope === 'team');
+  const team = edit?.scope === 'team';
   const save = () => {
     if (!word.trim() || (replace && !mis.trim())) return;
     const item: DictWord = {
@@ -255,9 +242,6 @@ function WordModal({ edit, preset, onClose }: { edit?: DictWord; preset?: string
         <span>Correct a misspelling</span>
         <Switch on={replace} onChange={setReplace} label="Correct a misspelling" />
       </div>
-      <label className="check-label">
-        <input type="checkbox" checked={team} onChange={(e) => setTeam(e.target.checked)} /> Share with team
-      </label>
       <div className="row-gap" style={{ gap: 12 }}>
         {replace && (
           <>
@@ -285,6 +269,7 @@ export function Snippets() {
   const heroHidden = useStore((s) => s.dismissed.snippetsHero);
   const { tab, q, sort, tabs } = useListChrome('Search your snippets', ['Newest first', 'Oldest first', 'Alphabetical (A-Z)']);
   const [modal, setModal] = useState<null | { edit?: Snippet; preset?: { trigger: string; expansion: string } }>(null);
+  useAddRequest(() => setModal({}));
   const [del, setDel] = useState<Snippet | null>(null);
   const file = useRef<HTMLInputElement>(null);
 
@@ -374,13 +359,6 @@ export function Snippets() {
                   {highlight(s.trigger, q)} <ArrowRight size={14} className="inline-arrow" /> {highlight(s.expansion, q)}
                 </p>
                 <div className="row-actions">
-                  <button
-                    className="icon-btn"
-                    data-tip={s.scope === 'team' ? 'Make personal' : 'Share with team'}
-                    onClick={() => setState((st) => ({ snippets: st.snippets.map((x) => (x.id === s.id ? { ...x, scope: x.scope === 'team' ? 'personal' : 'team' } : x)) }))}
-                  >
-                    <Users size={16} />
-                  </button>
                   <button className="icon-btn" data-tip="Edit" onClick={() => setModal({ edit: s })}>
                     <Pencil size={16} />
                   </button>
@@ -420,7 +398,7 @@ const MAX = 4000;
 function SnippetModal({ edit, preset, onClose }: { edit?: Snippet; preset?: { trigger: string; expansion: string }; onClose: () => void }) {
   const [trigger, setTrigger] = useState(edit?.trigger ?? preset?.trigger ?? '');
   const [exp, setExp] = useState(edit?.expansion ?? preset?.expansion ?? '');
-  const [team, setTeam] = useState(edit?.scope === 'team');
+  const team = edit?.scope === 'team';
   const ok = trigger.trim() && exp.trim() && exp.length <= MAX;
   const save = () => {
     if (!ok) return toast('Please enter a snippet and its expansion', { tone: 'error' });
@@ -445,14 +423,11 @@ function SnippetModal({ edit, preset, onClose }: { edit?: Snippet; preset?: { tr
         </>
       }
     >
-      <label className="check-label">
-        <input type="checkbox" checked={team} onChange={(e) => setTeam(e.target.checked)} /> Share with team
-      </label>
       <input className="field" autoFocus placeholder="Snippet" value={trigger} onChange={(e) => setTrigger(e.target.value)} />
       <textarea
         className="field"
         rows={10}
-        placeholder="Expansion"
+        placeholder="Expansion (you can use {name}, {email}, {date}, {time})"
         value={exp}
         onChange={(e) => setExp(e.target.value)}
         onKeyDown={(e) => (e.metaKey || e.ctrlKey) && e.key === 'Enter' && save()}

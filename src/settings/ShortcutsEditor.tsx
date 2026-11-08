@@ -1,6 +1,8 @@
 /* Shortcuts editor (spec: analysis/wispr-flow/UI_PAGES_ADDENDUM_2.md §3), adapted: one row per action, key chips,
-   click-to-record (live chord from the native event tap, so fn and modifier-only chords work), Esc cancels,
-   Backspace clears, conflict check, per-row and global reset. Changes are saved and applied immediately. */
+   click-to-record with a live chord from the native event tap (fn, modifier-only chords, mouse buttons 3-5; the tap
+   stops matching shortcuts while recording, so the keys you press do not trigger anything). A chord is saved as soon
+   as a non-modifier key or mouse button goes down, or, for modifier-only chords, when the keys are released.
+   Esc cancels, Backspace clears, conflicts and reserved combos are refused, changes apply in the helper at once. */
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Pencil, Plus, RotateCcw, Trash2, X } from 'lucide-react';
 import { setState, toast, useStore } from '../store';
@@ -15,6 +17,9 @@ import {
   chordWarning,
   codeToKeyName,
   defaultHotkeyMap,
+  isModifier,
+  mouseButtonName,
+  reservedWarning,
   defaultsFor,
   keyChip,
   MAX_CHORDS,
@@ -57,6 +62,7 @@ export default function ShortcutsDialog({ onClose }: { onClose: () => void }) {
   const [live, setLive] = useState<string[]>([]);
   const [errors, setErrors] = useState<Record<string, string>>({});
   const peak = useRef<string[]>([]);
+  const liveRef = useRef<string[]>([]);
   const recRef = useRef<Rec | null>(null);
   recRef.current = rec;
   const useNativeKeys = !!native && access?.tap !== 'off' && access !== null;
@@ -67,6 +73,7 @@ export default function ShortcutsDialog({ onClose }: { onClose: () => void }) {
     setRec(null);
     setLive([]);
     peak.current = [];
+    liveRef.current = [];
   };
 
   const commit = (r: Rec, keys: string[]) => {
@@ -77,6 +84,7 @@ export default function ShortcutsDialog({ onClose }: { onClose: () => void }) {
     if (chordId(chord) === 'esc' && action.id !== 'cancel') return; // Esc cancels recording
     if (chordId(chord) === 'backspace' || chordId(chord) === 'delete') {
       if (r.index >= 0) {
+        if (action.required && cur.length === 1) return toast(`${action.label} needs at least one shortcut`, { tone: 'error' });
         save(action.id, cur.filter((_, i) => i !== r.index));
         toast(`${action.label} shortcut cleared`);
       }
@@ -85,31 +93,59 @@ export default function ShortcutsDialog({ onClose }: { onClose: () => void }) {
     const others = { ...map, [action.id]: cur.filter((_, i) => i !== r.index) };
     const err = validateChord(action, chord, others, actions);
     if (err) {
+      // as in Wispr Flow: recording ends, the previous value stays, the reason is shown
       setErrors((e) => ({ ...e, [action.id]: err }));
+      toast(err, { tone: 'error' });
       return;
     }
     setErrors((e) => ({ ...e, [action.id]: '' }));
     const next = r.index >= 0 ? cur.map((c, i) => (i === r.index ? chord : c)) : [...cur, chord];
     save(action.id, next);
-    const warn = chordWarning(action.id, chord, { ...map, [action.id]: next });
-    toast(warn ?? 'Shortcut saved', warn ? { tone: 'error' } : {});
+    const warn = chordWarning(action.id, chord, { ...map, [action.id]: next }) ?? reservedWarning(chord);
+    toast(warn ? `Shortcut saved. ${warn}` : 'Shortcut saved', warn ? { tone: 'error' } : {});
   };
 
-  // live chord: from the native event tap (fn, modifier-only) or, without it, from this window's key events
+  // live chord: from the native event tap (fn, modifier-only, mouse buttons) or, without it, from this window's events
   useEffect(() => {
     if (!rec) return;
-    const onKeys = (down: string[]) => {
+    let done = false;
+    const finish = (keys: string[]) => {
       const r = recRef.current;
-      if (!r) return;
+      if (!r || done) return;
+      done = true;
+      commit(r, keys);
+    };
+    const onKeys = (down: string[]) => {
+      if (done) return;
+      liveRef.current = down;
       setLive(down);
       if (down.length >= peak.current.length) peak.current = down;
-      if (!down.length && peak.current.length) commit(r, peak.current);
+      // a key or mouse button completes the chord right away (at most one per chord)
+      if (down.some((k) => !isModifier(k))) return finish(down);
+      // modifier-only chords (fn, ⌃⌥) are saved when everything is released
+      if (!down.length && peak.current.length) finish(peak.current);
+    };
+    // mouse buttons pressed on the field (the tap also reports them; this covers the no-tap fallback)
+    const mouse = (e: MouseEvent) => {
+      const name = mouseButtonName(e.button);
+      if (!name) return;
+      e.preventDefault();
+      e.stopPropagation();
+      onKeys(normalize([...liveRef.current.filter(isModifier), name]));
+    };
+    const noMenu = (e: MouseEvent) => e.preventDefault();
+    window.addEventListener('mousedown', mouse, true);
+    window.addEventListener('contextmenu', noMenu, true);
+    const cleanupMouse = () => {
+      window.removeEventListener('mousedown', mouse, true);
+      window.removeEventListener('contextmenu', noMenu, true);
     };
     if (useNativeKeys) {
       native!.send('hotkeys:record', true);
       const off = native!.on('hotkeys:keys', onKeys);
       return () => {
         off();
+        cleanupMouse();
         native!.send('hotkeys:record', false);
       };
     }
@@ -117,6 +153,7 @@ export default function ShortcutsDialog({ onClose }: { onClose: () => void }) {
     const down = (e: KeyboardEvent) => {
       e.preventDefault();
       e.stopPropagation();
+      if (e.repeat) return;
       const k = codeToKeyName(e.code);
       if (!k) return;
       held.add(k);
@@ -134,6 +171,7 @@ export default function ShortcutsDialog({ onClose }: { onClose: () => void }) {
     window.addEventListener('keydown', down, true);
     window.addEventListener('keyup', up, true);
     return () => {
+      cleanupMouse();
       window.removeEventListener('keydown', down, true);
       window.removeEventListener('keyup', up, true);
     };
@@ -221,7 +259,7 @@ export default function ShortcutsDialog({ onClose }: { onClose: () => void }) {
                           live.length ? (
                             <KeyChips chord={live} small />
                           ) : (
-                            <span className="sc-placeholder">Press keys… (Esc cancels, ⌫ clears)</span>
+                            <span className="sc-placeholder">Press keys or a mouse button… (Esc cancels, ⌫ clears)</span>
                           )
                         ) : c ? (
                           <KeyChips chord={c} small />
@@ -234,7 +272,7 @@ export default function ShortcutsDialog({ onClose }: { onClose: () => void }) {
                         <button className="icon-btn" data-tip="Cancel" aria-label="Cancel recording" onClick={stop}>
                           <X size={16} />
                         </button>
-                      ) : c ? (
+                      ) : c && !(a.required && chords.length === 1) ? (
                         <button className="icon-btn" data-tip="Remove shortcut" aria-label="Remove shortcut" disabled={!!rec} onClick={() => save(a.id, chords.filter((_, j) => j !== i))}>
                           <Trash2 size={16} />
                         </button>

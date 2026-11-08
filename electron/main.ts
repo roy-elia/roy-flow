@@ -13,10 +13,12 @@ import { Helper, type HelperMessage } from './helper';
 import { buildAppMenu, buildTrayMenu, type MenuContext, type MenuSnapshot } from './menus';
 import * as ai from './ai';
 import { audioDir, audioPath, getData, hasData, loadData, patchData, pruneAudio, saveNow, wipeAll } from './data';
+import { rmSync } from 'node:fs';
 import { addToClaude, mcpInfo, startMcpServer, stopMcpServer } from './mcpServer';
 import { applyDictionary, applySnippets, changedWords, cleanUp, styleText, wordCount } from '../src/shared/textPipeline';
 import { allActions, bindingsOf, chordLabel, defaultHotkeyMap, helperBindings, toAccelerator, type HotkeyMap } from '../src/shared/hotkeys';
 import { categoryFor, styleKeyFor, type HistoryItem, type Meeting, type State, type Transform, type TranscriptSegment } from '../src/shared/types';
+import { applyMutation, emptyState, retainHistory } from '../src/shared/state';
 import {
   DEFAULT_MIC,
   LANGUAGE_LOCALES,
@@ -29,6 +31,7 @@ import {
   type FlowBarConfig,
   type MeetingStatus,
   type NavRequest,
+  type StoreMutation,
   type TransformChange,
 } from '../src/shared/ipc';
 
@@ -115,8 +118,8 @@ function sendTo<K extends keyof EventChannels>(win: BrowserWindow | null, ch: K,
 const windows = () => [hub, bar, scratch].filter((w): w is BrowserWindow => !!w && !w.isDestroyed());
 const broadcast = <K extends keyof EventChannels>(ch: K, payload?: EventChannels[K]) => windows().forEach((w) => sendTo(w, ch, payload));
 /** a notice on the Flow Bar (and a toast in the hub when it is focused) */
-function notice(text: string, tone?: 'error') {
-  sendTo(bar, 'flowbar:note', { text, tone });
+function notice(text: string, tone?: 'error', action?: { id: string; label: string }) {
+  sendTo(bar, 'flowbar:note', { text, tone, action });
   if (hub?.isFocused()) sendTo(hub, 'toast', { text, tone: tone === 'error' ? 'error' : 'success' });
 }
 
@@ -193,15 +196,22 @@ function createHub(show: boolean) {
   };
   hub.on('resize', saveBounds);
   hub.on('move', saveBounds);
-  hub.on('close', (e) => {
-    if (quitting) return;
-    e.preventDefault(); // keep running in the menu bar
-    hub?.hide();
+  // closing the hub destroys it (its renderer is ~50 MB); everything it shows lives in main and the data file,
+  // and showHub() recreates it on demand. The app keeps running in the menu bar.
+  hub.on('show', () => {
+    applyDockPolicy();
+    scheduleAccessPoll();
   });
-  hub.on('show', applyDockPolicy);
   hub.on('hide', applyDockPolicy);
   hub.on('focus', () => void checkAccess(false));
-  hub.on('closed', () => (hub = null));
+  hub.webContents.on('render-process-gone', () => setRecordMode(false));
+  hub.webContents.on('did-start-loading', () => setRecordMode(false));
+  hub.on('closed', () => {
+    setRecordMode(false);
+    hub = null;
+    applyDockPolicy();
+    scheduleAccessPoll();
+  });
   hub.webContents.setWindowOpenHandler(({ url }) => {
     if (/^https?:/.test(url)) shell.openExternal(url);
     return { action: 'deny' };
@@ -226,7 +236,7 @@ function showHub(nav?: NavRequest) {
 /** "Show app in dock": on = always in the dock; off = accessory (LSUIElement-style) while no window is visible */
 function applyDockPolicy() {
   if (!app.dock || quitting) return;
-  const visible = [hub, scratch].some((w) => !!w && !w.isDestroyed() && (w.isVisible() || w.isMinimized()));
+  const visible = [hub, scratch].some((w) => !!w && !w.isDestroyed() && !w.webContents.isDestroyed() && (w.isVisible() || w.isMinimized()));
   if (setting('showInDock', false) || visible) app.dock.show().catch(() => {});
   else app.dock.hide();
 }
@@ -299,8 +309,17 @@ function flowBarConfig(): FlowBarConfig {
 }
 const pushBarConfig = () => sendTo(bar, 'flowbar:config', flowBarConfig());
 
+/** while only the pill is showing the panel shrinks to this, so it covers (and composites) as little screen as possible */
+const BAR_SMALL: Record<DockEdge, { width: number; height: number }> = {
+  bottom: { width: 300, height: 110 },
+  left: { width: 120, height: 320 },
+  right: { width: 120, height: 320 },
+};
+let barExpanded = false;
+let barDisplay: Electron.Display | null = null;
+
 function barBounds(dock: DockEdge, area: Rectangle): Rectangle {
-  const { width, height } = BAR_SIZE[dock];
+  const { width, height } = (barExpanded ? BAR_SIZE : BAR_SMALL)[dock];
   const y = Math.round(area.y + (area.height - height) / 2);
   if (dock === 'left') return { x: area.x, y, width, height };
   if (dock === 'right') return { x: area.x + area.width - width, y, width, height };
@@ -309,15 +328,16 @@ function barBounds(dock: DockEdge, area: Rectangle): Rectangle {
 
 function positionBar(onCursorDisplay = false) {
   if (!bar || bar.isDestroyed()) return;
-  const display = onCursorDisplay ? screen.getDisplayNearestPoint(screen.getCursorScreenPoint()) : screen.getPrimaryDisplay();
+  const display = onCursorDisplay ? screen.getDisplayNearestPoint(screen.getCursorScreenPoint()) : barDisplay && screen.getAllDisplays().some((d) => d.id === barDisplay!.id) ? barDisplay : screen.getPrimaryDisplay();
+  barDisplay = display;
   bar.setBounds(barBounds(flowBarConfig().dock, display.workArea));
 }
 
 function createBar() {
   bar = new BrowserWindow({
     type: 'panel', // NSPanel: never activates the app, so paste targets stay frontmost
-    width: BAR_SIZE.bottom.width,
-    height: BAR_SIZE.bottom.height,
+    width: BAR_SMALL.bottom.width,
+    height: BAR_SMALL.bottom.height,
     frame: false,
     transparent: true,
     backgroundColor: '#00000000',
@@ -410,6 +430,7 @@ function failDictation(message: string) {
 
 async function startDictation(how: 'toggle' | 'ptt') {
   if (phase === 'recording' || phase === 'processing') return;
+  dropCancelled();
   if (meeting) return failDictation('Notetaker is recording. Stop it before dictating.');
   if (!helper.available) return failDictation('Native helper missing. Run npm run native.');
   interim = '';
@@ -443,11 +464,12 @@ async function startDictation(how: 'toggle' | 'ptt') {
 let permissionHint = false; // interim currently holds a permission hint, not speech
 const heard = () => (permissionHint ? '' : interim);
 
-async function stopDictation() {
-  if (phase !== 'recording') return;
-  setPhase('processing', { kind: 'dictation' });
-  mute(false);
-  const fin = await new Promise<Final>((resolve) => {
+/** recordings shorter than this, or with no words, are dropped without a message */
+const MIN_RECORDING_MS = 400;
+
+/** stop the helper and wait for its final transcript (falls back to the last partial after 5 s) */
+function finishRecording(): Promise<Final> {
+  return new Promise<Final>((resolve) => {
     const t = setTimeout(() => {
       finalWaiter = null;
       resolve({ text: heard(), audio: null, seconds: (Date.now() - startedAt) / 1000 });
@@ -459,43 +481,108 @@ async function stopDictation() {
     };
     helper.send({ cmd: 'stop' });
   });
+}
+
+async function stopDictation() {
+  if (phase !== 'recording') return;
+  const heldMs = Date.now() - startedAt;
+  setPhase('processing', { kind: 'dictation' });
+  mute(false);
+  const fin = await finishRecording();
   session = null;
   const raw = fin.text.trim();
-  if (!raw) {
-    sound('cancel');
-    return failDictation('No speech detected');
+  if (!raw || heldMs < MIN_RECORDING_MS) {
+    // nothing said (or an accidental tap): drop it quietly, like Wispr does
+    log('[dictation] dropped', { heldMs, chars: raw.length });
+    discardAudio(fin.audio);
+    interim = '';
+    return setPhase('idle');
   }
   sound('stop');
-  const out = await processDictation(raw);
+  await deliver(raw, fin, pendingId, startedAt, frontApp);
+  interim = '';
+  setPhase('idle');
+}
+
+function discardAudio(file: string | null) {
+  if (file) rmSync(file, { force: true });
+}
+
+/** clean up, paste and record one dictation */
+async function deliver(raw: string, fin: Final, id: string, ts: number, app: { bundleId: string; name: string }) {
+  const out = await processDictation(raw, app);
   const res = await pasteText(out.text);
   const item: HistoryItem = {
-    id: pendingId,
-    ts: startedAt,
+    id,
+    ts,
     text: out.text,
     original: raw,
     status: 'ok',
-    app: frontApp.name || undefined,
-    bundleId: frontApp.bundleId || undefined,
-    category: categoryFor(frontApp.bundleId),
+    app: app.name || undefined,
+    bundleId: app.bundleId || undefined,
+    category: categoryFor(app.bundleId),
     words: wordCount(out.text),
-    durationMs: Math.round((fin.seconds || (Date.now() - startedAt) / 1000) * 1000),
+    durationMs: Math.round((fin.seconds || (Date.now() - ts) / 1000) * 1000),
     fixes: out.fixes,
     dictFixes: out.dictFixes,
     audio: fin.audio ? path.basename(fin.audio) : undefined,
     engine: out.engine,
   };
+  mutate({ collection: 'history', op: 'add', item });
   broadcast('dictation:result', { item, ...res, note: out.note });
-  interim = '';
-  setPhase('idle');
 }
+
+/** a cancelled dictation, kept for a few seconds so "Undo" on the Flow Bar can still paste it */
+let cancelled: { raw: Promise<Final>; id: string; ts: number; app: { bundleId: string; name: string }; timer: NodeJS.Timeout } | null = null;
+const UNDO_MS = 6000;
 
 function cancelDictation(silent = false) {
   if (phase !== 'recording') return;
-  helper.send({ cmd: 'cancel' });
-  session = null;
   mute(false);
-  if (!silent) sound('cancel');
   interim = '';
+  const heldMs = Date.now() - startedAt;
+  if (silent || heldMs < 1000) {
+    helper.send({ cmd: 'cancel' });
+    session = null;
+    if (!silent) sound('cancel');
+    return setPhase('idle');
+  }
+  // Esc after real speech: finish recognition in the background and offer Undo
+  sound('cancel');
+  dropCancelled();
+  const id = pendingId;
+  const raw = finishRecording().then((f) => {
+    session = null;
+    return f;
+  });
+  cancelled = { raw, id, ts: startedAt, app: frontApp, timer: setTimeout(dropCancelled, UNDO_MS) };
+  setPhase('idle');
+  pinBar(UNDO_MS);
+  notice('Dictation cancelled', undefined, { id: 'undo-cancel', label: 'Undo' });
+}
+
+function dropCancelled() {
+  const c = cancelled;
+  if (!c) return;
+  cancelled = null;
+  clearTimeout(c.timer);
+  void c.raw.then((f) => discardAudio(f.audio));
+}
+
+async function undoCancel() {
+  const c = cancelled;
+  if (!c) return;
+  cancelled = null;
+  clearTimeout(c.timer);
+  setPhase('processing', { kind: 'dictation' });
+  const fin = await c.raw;
+  const raw = fin.text.trim();
+  if (!raw) {
+    discardAudio(fin.audio);
+    setPhase('idle');
+    return notice('Nothing was heard in that dictation.');
+  }
+  await deliver(raw, fin, c.id, c.ts, c.app);
   setPhase('idle');
 }
 
@@ -505,28 +592,31 @@ function toggleDictation() {
 }
 
 /** clean-up (Claude Haiku or rules), style per app category, dictionary, snippets, optional auto-applied Transform */
-async function processDictation(raw: string): Promise<{ text: string; fixes: number; dictFixes: number; engine: 'claude' | 'rules'; note?: string }> {
+async function processDictation(raw: string, target: { bundleId: string; name: string }): Promise<{ text: string; fixes: number; dictFixes: number; engine: 'claude' | 'rules'; note?: string }> {
   const dict = (D().dictionary ?? []).map((w) => ({ word: w.word, misspelling: w.misspelling }));
   const snippets = (D().snippets ?? []).map((s) => ({ trigger: s.trigger, expansion: s.expansion }));
-  const category = categoryFor(frontApp.bundleId);
+  const category = categoryFor(target.bundleId);
   const style = (D().styles ?? {})[styleKeyFor(category)] ?? 'formal';
-  const level = setting('autoCleanup', 'Medium');
+  // in code editors and terminals keep text literal: no forced capitals or full stops ("Code-aware dictation")
+  const codeAware = category === 'code' && setting('codeAware', true);
+  const level = codeAware ? 'Light' : setting('autoCleanup', 'Medium');
   const d1 = applyDictionary(raw, dict);
   let text = '';
   let engine: 'claude' | 'rules' = 'rules';
   let note: string | undefined;
   if (ai.hasKey() && setting('aiCleanup', true)) {
     try {
-      text = await ai.cleanupDictation(d1.text, { level, style, app: frontApp.name, category });
+      text = await ai.cleanupDictation(d1.text, { level, style: codeAware ? 'code' : style, app: target.name, category });
       engine = 'claude';
     } catch (e) {
       note = `${ai.errorText(e)} Used basic clean-up instead.`;
       log('[ai] cleanup failed', note);
     }
   }
-  if (!text) text = styleText(cleanUp(d1.text, level), style);
+  if (!text) text = codeAware ? cleanUp(d1.text, 'Light') : styleText(cleanUp(d1.text, level), style);
   const d2 = applyDictionary(text, dict);
-  const sn = applySnippets(d2.text, snippets);
+  const u = D().user;
+  const sn = applySnippets(d2.text, snippets, { first: u?.firstName, last: u?.lastName, email: u?.email });
   text = sn.text;
   if (setting('autoApply', false) && setting('transformsOptIn', true)) {
     const t = transforms().find((x) => x.name === setting('autoApplyTransform', 'Polish'));
@@ -596,7 +686,7 @@ async function transformHotkey(id: string) {
   } else {
     await clipboard.writeText(after);
     const last = [...okHistory()].sort((a, b) => b.ts - a.ts)[0];
-    if (last) sendTo(hub, 'store:mutate', { collection: 'history', op: 'patch', id: last.id, patch: { text: after } });
+    if (last) mutate({ collection: 'history', op: 'patch', id: last.id, patch: { text: after } });
     notice(`No text was selected, so ${t.name} ran on your last dictation and copied it${hint}`);
   }
   setPhase('idle');
@@ -700,7 +790,7 @@ async function stopMeeting(reason?: string) {
     actionItems: [],
     summaryStatus: m.segments.length ? (ai.hasKey() ? 'pending' : 'nokey') : 'done',
   };
-  sendTo(hub, 'store:mutate', { collection: 'meetings', op: 'add', item: rec });
+  mutate({ collection: 'meetings', op: 'add', item: rec });
   log('[meeting] saved', { segments: m.segments.length, durationSec });
   if (reason) notify('Notetaker stopped', `${reason}. Your note “${m.title}” was saved.`, 'notetaker');
   pushMeetingStatus();
@@ -714,17 +804,17 @@ async function stopMeeting(reason?: string) {
 async function summarize(m: Meeting): Promise<{ ok: boolean; error?: string }> {
   if (!m.transcript?.length) return { ok: false, error: 'This note has no transcript to summarise.' };
   if (!ai.hasKey()) {
-    sendTo(hub, 'store:mutate', { collection: 'meetings', op: 'patch', id: m.id, patch: { summaryStatus: 'nokey' } });
+    mutate({ collection: 'meetings', op: 'patch', id: m.id, patch: { summaryStatus: 'nokey' } });
     return { ok: false, error: new ai.NoKeyError().message };
   }
-  sendTo(hub, 'store:mutate', { collection: 'meetings', op: 'patch', id: m.id, patch: { summaryStatus: 'pending' } });
+  mutate({ collection: 'meetings', op: 'patch', id: m.id, patch: { summaryStatus: 'pending' } });
   try {
     const s = await ai.summarizeMeeting(m);
-    sendTo(hub, 'store:mutate', { collection: 'meetings', op: 'patch', id: m.id, patch: { title: s.title, overview: s.overview, actionItems: s.actionItems, summaryStatus: 'done', summaryError: undefined } });
+    mutate({ collection: 'meetings', op: 'patch', id: m.id, patch: { title: s.title, overview: s.overview, actionItems: s.actionItems, summaryStatus: 'done', summaryError: undefined } });
     return { ok: true };
   } catch (e) {
     const error = ai.errorText(e);
-    sendTo(hub, 'store:mutate', { collection: 'meetings', op: 'patch', id: m.id, patch: { summaryStatus: 'error', summaryError: error } });
+    mutate({ collection: 'meetings', op: 'patch', id: m.id, patch: { summaryStatus: 'error', summaryError: error } });
     return { ok: false, error };
   }
 }
@@ -733,7 +823,7 @@ const toggleMeeting = () => (meeting ? void stopMeeting() : void startMeeting().
 
 /* ------------------------------------------------------------------ helper messages */
 helper.on('message', (m: HelperMessage) => {
-  if (!['level', 'partial', 'keys', 'segment'].includes(m.type)) log('[helper]', m.type === 'final' ? { type: 'final', chars: String(m.text ?? '').length } : m);
+  if (!['level', 'partial', 'keys', 'segment', 'access'].includes(m.type)) log('[helper]', m.type === 'final' ? { type: 'final', chars: String(m.text ?? '').length } : m);
   switch (m.type) {
     case 'partial':
       if (session === 'meeting' && meeting) {
@@ -760,6 +850,7 @@ helper.on('message', (m: HelperMessage) => {
       }
       break;
     case 'started':
+      if (typeof m.ms === 'number') log('[dictation] mic started', { ms: m.ms, device: m.device });
       if (phase === 'recording' && permissionHint) {
         permissionHint = false;
         interim = '';
@@ -825,7 +916,11 @@ helper.on('exit', (code: number | null, sig: string | null) => {
   if (finalWaiter) finalWaiter({ text: '', audio: null, seconds: 0 });
   if (meetingFinal) meetingFinal(false);
   // respawn so global shortcuts keep working
-  if (!quitting) setTimeout(() => sendHotkeys(), 1000);
+  if (!quitting)
+    setTimeout(() => {
+      sendHotkeys();
+      warmMic();
+    }, 1000);
 });
 
 /* ------------------------------------------------------------------ global shortcuts */
@@ -920,6 +1015,14 @@ function applyFallbackShortcuts() {
   log('[shortcuts] fallback', { registered: fallbackRegistered, failed: fallbackFailed });
 }
 
+/** shortcut capture in the helper (global matching paused). Never left on: 20 s cap, and off when the hub goes away. */
+let recordTimer: NodeJS.Timeout | undefined;
+function setRecordMode(on: boolean) {
+  clearTimeout(recordTimer);
+  helper.send({ cmd: 'record', on });
+  if (on) recordTimer = setTimeout(() => helper.send({ cmd: 'record', on: false }), 20_000);
+}
+
 /* ------------------------------------------------------------------ clipboard + paste */
 /** snapshot every MIME type on the pasteboard so it can be put back after the paste */
 async function saveClipboard(): Promise<ClipboardItem[]> {
@@ -997,9 +1100,21 @@ async function checkAccess(prompt: boolean, listen = false): Promise<AccessStatu
   }
   if (JSON.stringify(next) !== JSON.stringify(access)) {
     access = next;
+    log("[access] changed", access);
     broadcast('access:changed', access);
   }
   return access;
+}
+let accessTimer: NodeJS.Timeout | undefined;
+/** permission polling: every 5 s while the hub is open or the event tap is not fully active, else every 60 s */
+function scheduleAccessPoll() {
+  clearTimeout(accessTimer);
+  const hubVisible = !!hub && !hub.isDestroyed() && hub.isVisible();
+  const ms = hubVisible || tapState !== 'active' ? 5000 : 60_000;
+  accessTimer = setTimeout(async () => {
+    await checkAccess(false);
+    scheduleAccessPoll();
+  }, ms);
 }
 const PANES = {
   accessibility: 'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility',
@@ -1149,12 +1264,12 @@ const menuContext = (): MenuContext => ({
   openHub: showHub,
   toggleDictation,
   toggleMeeting,
+  startMeeting: (title: string) => void startMeeting(title).then((r) => !r.ok && notice(r.error ?? 'Could not start Notetaker', 'error')),
   openScratchpad,
   pasteLast,
   copyLast,
-  checkUpdates: () => {
-    dialog.showMessageBox({ type: 'info', message: 'Roy Flow is up to date', detail: `Version ${app.getVersion()}. This local build does not update itself.`, buttons: ['OK'] });
-  },
+  version: app.getVersion(),
+  logMetrics: () => void logMetrics(true),
   setSetting: (key, value) => mainPatch({ settings: { ...(D().settings ?? {}), [key]: value } }),
   quit: () => {
     quitting = true;
@@ -1188,6 +1303,11 @@ function createTray() {
 }
 
 /* ------------------------------------------------------------------ data changes */
+/** add/patch a history item or meeting: main owns the data, so this works with the hub window closed */
+function mutate(m: StoreMutation) {
+  mainPatch(applyMutation(D(), m));
+}
+
 /** a patch made by main itself: apply and fan out to every window */
 function mainPatch(p: Partial<State>) {
   const prev = patchData(p);
@@ -1206,6 +1326,8 @@ function onDataChanged(prev: Partial<State>, keys: string[]) {
     if (s.hideInCapture !== p.hideInCapture) bar?.setContentProtection(!!s.hideInCapture);
     if (s.showNextMeeting !== p.showNextMeeting || s.connected_gcal !== p.connected_gcal || s.connected_outlook !== p.connected_outlook) updateTrayTitle();
     if (s.muteWhileDictating === false && muted) mute(false);
+    if (s.microphone !== p.microphone || s.language !== p.language) warmMic();
+    if (s.localStorage !== p.localStorage) applyRetention();
   }
   if (keys.includes('hotkeys') || keys.includes('transforms')) {
     sendHotkeys();
@@ -1215,12 +1337,24 @@ function onDataChanged(prev: Partial<State>, keys: string[]) {
   if (keys.includes('history')) {
     const ref = new Set((n.history ?? []).map((h) => h.audio).filter((a): a is string => !!a));
     const dropped = pruneAudio(ref);
-    if (dropped.length) for (const h of n.history ?? []) if (h.audio && dropped.includes(h.audio)) sendTo(hub, 'store:mutate', { collection: 'history', op: 'patch', id: h.id, patch: { audio: undefined } });
+    if (dropped.length) for (const h of n.history ?? []) if (h.audio && dropped.includes(h.audio)) mutate({ collection: 'history', op: 'patch', id: h.id, patch: { audio: undefined } });
     checkMilestones();
   }
   pushBarConfig();
   updateBarVisibility();
   rebuildMenus();
+}
+
+/** have the helper build the audio engine and recognizer now, so the first key-down starts recording fast */
+function warmMic() {
+  const mic = setting('microphone', DEFAULT_MIC);
+  helper.send({ cmd: 'warm', locale: LANGUAGE_LOCALES[setting('language', 'English')] ?? 'en-US', device: mic === DEFAULT_MIC ? '' : mic });
+}
+
+/** "Auto-delete after 30 days" */
+function applyRetention() {
+  const kept = retainHistory(D().history ?? [], setting('localStorage', 'Store normally'));
+  if (kept) mainPatch({ history: kept });
 }
 
 function applyLoginItem() {
@@ -1261,12 +1395,20 @@ function wireIpc() {
   ipcMain.on('dictation:toggle', toggleDictation);
   ipcMain.on('dictation:cancel', () => cancelDictation());
   ipcMain.on('flowbar:interactive', (_e, on: boolean) => setBarInteractive(!!on));
+  ipcMain.on('flowbar:expand', (_e, on: boolean) => {
+    if (barExpanded === !!on) return;
+    barExpanded = !!on;
+    positionBar();
+  });
+  ipcMain.on('flowbar:action', (_e, id: string) => {
+    if (id === 'undo-cancel') void undoCancel();
+  });
   ipcMain.on('flowbar:ready', () => {
     pushBarConfig();
     sendTo(bar, 'dictation:status', { phase, interim, kind: phaseKind });
   });
   ipcMain.on('hub:open', (_e, nav: NavRequest) => showHub(nav));
-  ipcMain.on('hotkeys:record', (_e, on: boolean) => helper.send({ cmd: 'record', on: !!on }));
+  ipcMain.on('hotkeys:record', (_e, on: boolean) => setRecordMode(!!on));
   ipcMain.on('scratchpad:open', openScratchpad);
   ipcMain.on('scratchpad:close', () => scratch?.close());
   ipcMain.on('meeting:toggle', toggleMeeting);
@@ -1300,10 +1442,9 @@ function wireIpc() {
     const h = (D().history ?? []).find((x) => x.id === id);
     if (!h) return { ok: false, error: 'Transcript not found' };
     const raw = h.original ?? h.text;
-    frontApp = { bundleId: h.bundleId ?? '', name: h.app ?? '' };
-    const out = await processDictation(raw).catch(() => null);
+    const out = await processDictation(raw, { bundleId: h.bundleId ?? '', name: h.app ?? '' }).catch(() => null);
     if (!out) return { ok: false, error: 'Retry failed' };
-    sendTo(hub, 'store:mutate', { collection: 'history', op: 'patch', id, patch: { text: out.text, cleaned: undefined, original: raw, fixes: out.fixes, dictFixes: out.dictFixes, engine: out.engine, words: wordCount(out.text) } });
+    mutate({ collection: 'history', op: 'patch', id, patch: { text: out.text, cleaned: undefined, original: raw, fixes: out.fixes, dictFixes: out.dictFixes, engine: out.engine, words: wordCount(out.text) } });
     return { ok: true, error: out.note };
   });
   ipcMain.handle('ai:transform', async (_e, { text, prompt, name }: { text: string; prompt: string; name: string }) => {
@@ -1382,6 +1523,18 @@ app.on('activate', () => showHub());
 app.on('before-quit', () => {
   quitting = true;
 });
+/* ------------------------------------------------------------------ resource metrics (Help › Log Resource Usage, or `kill -USR2 <pid>`) */
+async function logMetrics(show = false) {
+  const procs = app.getAppMetrics().map((m) => ({ type: m.type, name: m.name ?? '', pid: m.pid, cpu: Math.round(m.cpu.percentCPUUsage * 10) / 10, rssMB: Math.round((m.memory.workingSetSize / 1024) * 10) / 10 }));
+  const helperPid = helper.pid;
+  const total = procs.reduce((n, p) => n + p.rssMB, 0);
+  const snapshot = { at: new Date().toISOString(), hub: !!hub && !hub.isDestroyed() ? (hub.isVisible() ? 'visible' : 'hidden') : 'closed', phase, electronRssMB: Math.round(total), helperPid, procs };
+  log('[metrics]', snapshot);
+  writeJson('metrics.json', snapshot);
+  if (show) dialog.showMessageBox({ type: 'info', message: `Roy Flow uses ${Math.round(total)} MB (Electron processes)`, detail: procs.map((p) => `${p.type}${p.name ? ` (${p.name})` : ''}: ${p.rssMB} MB, ${p.cpu}% CPU`).join('\n') + '\n\nThe native helper is not included. Details were written to main.log.', buttons: ['OK'] });
+}
+process.on('SIGUSR2', () => void logMetrics());
+
 app.on('will-quit', () => {
   globalShortcut.unregisterAll();
   if (muted) helper.send({ cmd: 'mute', on: false });
@@ -1395,13 +1548,25 @@ app.on('window-all-closed', () => {
 
 app.whenReady().then(async () => {
   loadData();
+  if (!hasData()) {
+    // first run: main creates the data file, so it never depends on a hub window being open
+    const s = emptyState();
+    try {
+      const [first = '', ...rest] = execFileSync('/usr/bin/id', ['-F'], { encoding: 'utf8' }).trim().split(' ');
+      s.user = { ...s.user, firstName: first, lastName: rest.join(' ') };
+    } catch {
+      /* no full name */
+    }
+    patchData(s);
+  }
   log('[app] ready', { version: app.getVersion(), packaged: app.isPackaged, helper: helper.available, data: hasData() });
   if (!isDev) serveDist();
   wireIpc();
   createTray();
   createBar();
   const atLogin = app.getLoginItemSettings().wasOpenedAtLogin;
-  createHub(!process.argv.includes('--hidden') && !atLogin);
+  // the hub window is only created when it is shown (it is destroyed again when closed)
+  if (!process.argv.includes('--hidden') && !atLogin) createHub(true);
   applyDockPolicy();
   if (hasData()) applyLoginItem();
   sendHotkeys();
@@ -1411,7 +1576,10 @@ app.whenReady().then(async () => {
   await refreshCalendar(false);
   startMcpServer(meetingsList, log);
   startupAnnouncements();
-  setInterval(() => void checkAccess(false), 5000);
+  scheduleAccessPoll();
+  warmMic();
+  applyRetention();
+  setInterval(applyRetention, 6 * 3600_000);
   setInterval(() => {
     updateTrayTitle();
     meetingReminders();
@@ -1421,5 +1589,8 @@ app.whenReady().then(async () => {
   }, 1000);
   setInterval(() => calendar.status === 'authorized' && void refreshCalendar(false), 5 * 60_000);
   screen.on('display-metrics-changed', () => positionBar());
-  screen.on('display-removed', () => positionBar());
+  screen.on('display-removed', () => {
+    barDisplay = null;
+    positionBar();
+  });
 });

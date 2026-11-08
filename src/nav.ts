@@ -20,6 +20,12 @@ export interface Nav {
   noteId: string | null;
   insightsTab: 'usage' | 'voice';
   modal: null | 'help' | 'referral' | 'notifications' | 'account' | 'shortcuts';
+  /** a meeting to open on the Notetaker page (from the menu bar) */
+  meeting?: string | null;
+  /** open the Add dialog on Dictionary / Snippets (from the menu bar) */
+  add?: boolean;
+  /** open the Style page on this tab */
+  styleTab?: string;
 }
 
 const PAGES: PageId[] = ['home', 'notetaker', 'insights', 'dictionary', 'snippets', 'style', 'transforms', 'scratchpad'];

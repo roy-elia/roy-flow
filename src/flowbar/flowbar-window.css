@@ -1,4 +1,51 @@
-/* Flow Bar panel window: fully transparent page, pill docked to the window edge that faces the screen edge. */
+/* Flow Bar panel window: fully transparent page, pill docked to the window edge that faces the screen edge.
+   This page loads only tokens.css + flowbar.css + this file (not the hub's base/pages CSS), so the reset it needs is here. */
+@font-face {
+  font-family: 'Figtree';
+  src: url('/fonts/Figtree-VariableFont_wght.ttf') format('truetype');
+  font-weight: 300 900;
+  font-style: normal;
+}
+:root {
+  --ease: cubic-bezier(0.05, 0.6, 0.4, 0.95);
+}
+* {
+  box-sizing: border-box;
+}
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+html.flowbar-window {
+  font-family: Figtree, system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  font-size: 14px;
+  line-height: 20px;
+  color: #fff;
+}
+.flowbar-window button {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+}
+/* the note's action button (e.g. Undo after Esc) */
+.fb-note .fb-note-action {
+  margin-left: 10px;
+  font-weight: 600;
+  color: var(--signal-500);
+}
+/* nothing animates while the bar is hidden or idle */
+@media (prefers-reduced-motion: reduce) {
+  .flowbar-window * {
+    animation: none !important;
+    transition: none !important;
+  }
+}
 html.flowbar-window,
 html.flowbar-window body {
   background: transparent !important;

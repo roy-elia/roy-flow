@@ -1,7 +1,7 @@
 {
   "name": "roy-flow",
   "private": true,
-  "version": "1.1.0",
+  "version": "1.2.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -14,7 +14,9 @@
     "app:dev": "npm run native && npm run electron:build && concurrently -k -n vite,app \"vite\" \"wait-on tcp:5188 && ROYFLOW_DEV_URL=http://localhost:5188 electron .\"",
     "app:build": "npm run typecheck && vite build && npm run electron:build && npm run native && electron-builder --mac dir --arm64 && sh scripts/sign.sh",
     "app:install": "sh scripts/install.sh",
-    "sounds": "node scripts/make-sounds.mjs"
+    "sounds": "node scripts/make-sounds.mjs",
+    "test": "vitest run",
+    "test:native": "sh native/build.sh && native/build/RoyFlowHelper --selftest"
   },
   "devDependencies": {
     "@types/node": "^26.6.6",
@@ -30,6 +32,7 @@
     "react-dom": "^19.3.1",
     "typescript": "^7.0.2",
     "vite": "^8.3.6",
+    "vitest": "^5.1.0",
     "wait-on": "^9.5.1"
   },
   "description": "Roy Flow: a dictation app UI, as a web app and a macOS desktop app",
@@ -38,7 +41,7 @@
   "build": {
     "appId": "com.royelia.royflow",
     "productName": "Roy Flow",
-    "copyright": "Copyright © 2026 Roy Elia",
+    "copyright": "Copyright \u00a9 2026 Roy Elia",
     "directories": {
       "output": "release",
       "buildResources": "build"

@@ -1,6 +1,15 @@
 /* Claude features, main process only. The API key is stored encrypted with safeStorage (Keychain-backed),
    is never sent to a renderer, and is never logged. */
-import Anthropic from '@anthropic-ai/sdk';
+import type AnthropicType from '@anthropic-ai/sdk';
+// The SDK (~1.3 MB of JS) is bundled separately (dist-electron/anthropic.cjs) and loaded on the first Claude call,
+// so it costs no memory or start-up time for people who never add a key.
+type AnthropicCtor = typeof AnthropicType;
+let SDK: AnthropicCtor | null = null;
+function sdk(): AnthropicCtor {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  return (SDK ??= (require('./anthropic.cjs') as { default: AnthropicCtor }).default);
+}
+type Anthropic = AnthropicType;
 import { app, safeStorage } from 'electron';
 import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
@@ -50,7 +59,7 @@ export function clearKey() {
 function api(): Anthropic {
   const k = getKey();
   if (!k) throw new NoKeyError();
-  if (!client) client = new Anthropic({ apiKey: k, maxRetries: 1 });
+  if (!client) client = new (sdk())({ apiKey: k, maxRetries: 1 });
   return client;
 }
 
@@ -63,6 +72,8 @@ export class NoKeyError extends Error {
 /** user-facing message for any failure (never includes the key) */
 export function errorText(e: unknown): string {
   if (e instanceof NoKeyError) return e.message;
+  if (!SDK) return e instanceof Error ? e.message : String(e);
+  const Anthropic = SDK;
   if (e instanceof Anthropic.AuthenticationError) return 'Claude rejected the API key. Check it in Settings › Account.';
   if (e instanceof Anthropic.PermissionDeniedError) return 'This API key is not allowed to use that model.';
   if (e instanceof Anthropic.RateLimitError) return 'Claude is rate limiting requests right now. Try again in a minute.';
@@ -125,6 +136,7 @@ const STYLE_GUIDE: Record<string, string> = {
   casual: 'Casual: normal capitalisation, lighter punctuation (drop final periods, fewer commas).',
   very: 'Very casual: all lowercase, minimal punctuation.',
   excited: 'Excited: upbeat, end sentences with exclamation marks where natural.',
+  code: 'Code editor or terminal: keep it literal. Do not capitalise the first word or add a final period; keep identifiers, file names and symbols exactly as spoken.',
 };
 const LEVEL_GUIDE: Record<string, string> = {
   Light: 'Light: only remove filler words (um, uh, you know), stutters and obvious false starts. Do not change punctuation much.',
@@ -141,7 +153,7 @@ export async function cleanupDictation(text: string, opts: { level: string; styl
     `Clean-up level. ${LEVEL_GUIDE[opts.level] ?? LEVEL_GUIDE.Medium}`,
     `Style for this app (${opts.app || 'unknown app'}, category ${opts.category}). ${STYLE_GUIDE[opts.style] ?? STYLE_GUIDE.formal}`,
   ].join('\n');
-  const out = await complete({ model: MODELS.quick, system, user: `<dictation>\n${text}\n</dictation>`, maxTokens: 4000, effort: 'low', timeoutMs: 9000 });
+  const out = await complete({ model: MODELS.quick, system, user: `<dictation>\n${text}\n</dictation>`, maxTokens: 4000, effort: 'low', timeoutMs: 6000 });
   return out.replace(/^<dictation>\s*|\s*<\/dictation>$/g, '').trim();
 }
 

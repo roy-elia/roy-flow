@@ -33,9 +33,14 @@ import Foundation
 import Speech
 
 setvbuf(stdout, nil, _IOLBF, 0)
+let selfTestMode = CommandLine.arguments.contains("--selftest")
 let outQueue = DispatchQueue(label: "royflow.helper.out")
 
+/// --selftest captures messages here instead of writing them to stdout
+var emitSink: (([String: Any]) -> Void)?
+
 func emit(_ obj: [String: Any]) {
+    if let sink = emitSink { return sink(obj) }
     outQueue.async {
         guard let data = try? JSONSerialization.data(withJSONObject: obj), let line = String(data: data, encoding: .utf8) else { return }
         FileHandle.standardOutput.write((line + "\n").data(using: .utf8)!)
@@ -161,6 +166,7 @@ final class Dictation {
         guard finished else { return emitError("busy", mode == "meeting" ? "Something is already recording" : "A recording is already running") }
         finished = false
         stopping = false
+        startRequested = Date()
         lastText = ""
         self.mode = mode
         session += 1
@@ -211,8 +217,52 @@ final class Dictation {
         return req
     }
 
+    // warm audio: the engine (and its input audio unit) is built once per device and kept prepared, so a
+    // key-down only has to install a tap and start it. The mic is only open while recording.
+    private var warm: (engine: AVAudioEngine, device: String, used: String)?
+    private var recognizers: [String: SFSpeechRecognizer] = [:]
+    private var configObserver: NSObjectProtocol?
+    private var startRequested = Date()
+
+    private func recognizerFor(_ locale: String) -> SFSpeechRecognizer? {
+        if let r = recognizers[locale] { return r }
+        let r = SFSpeechRecognizer(locale: Locale(identifier: locale)) ?? SFSpeechRecognizer()
+        if let r { recognizers[locale] = r }
+        return r
+    }
+
+    /// build (or reuse) the engine for an input device name ("" = system default)
+    private func engineFor(_ device: String) -> (AVAudioEngine, String) {
+        if let w = warm, w.device == device { return (w.engine, w.used) }
+        warm = nil
+        let engine = AVAudioEngine()
+        let input = engine.inputNode
+        var used = "default"
+        if !device.isEmpty, let match = inputDevices().first(where: { $0.name == device }), let au = input.audioUnit {
+            var devId = match.id
+            if AudioUnitSetProperty(au, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &devId, UInt32(MemoryLayout<AudioDeviceID>.size)) == noErr { used = match.name }
+        }
+        if let o = configObserver { NotificationCenter.default.removeObserver(o) }
+        // a device was plugged/unplugged or the format changed: rebuild on the next start
+        configObserver = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main) { [weak self] _ in
+            guard let self, self.finished else { return }
+            self.warm = nil
+        }
+        warm = (engine, device, used)
+        return (engine, used)
+    }
+
+    /// pre-build the engine and recognizer so the first dictation starts fast (does not open the mic)
+    func prewarm(locale: String, device: String?) {
+        guard finished, AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else { return }
+        let (engine, _) = engineFor(device ?? "")
+        _ = engine.inputNode.outputFormat(forBus: 0)
+        engine.prepare()
+        if SFSpeechRecognizer.authorizationStatus() == .authorized { _ = recognizerFor(locale) }
+    }
+
     private func begin(locale: String, device: String?, record: String?, session id: Int) {
-        guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: locale)) ?? SFSpeechRecognizer(), recognizer.isAvailable else {
+        guard let recognizer = recognizerFor(locale), recognizer.isAvailable else {
             finished = true
             return emitError("unavailable", "Speech recognition is not available for \(locale)")
         }
@@ -220,19 +270,12 @@ final class Dictation {
         let onDevice = recognizer.supportsOnDeviceRecognition
         let req = makeRequest(onDevice: onDevice)
 
-        let engine = AVAudioEngine()
+        let (engine, usedDevice) = engineFor(device ?? "")
         let input = engine.inputNode
-        var usedDevice = "default"
-        if let device, !device.isEmpty {
-            if let match = inputDevices().first(where: { $0.name == device }), let au = input.audioUnit {
-                var devId = match.id
-                let st = AudioUnitSetProperty(au, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &devId, UInt32(MemoryLayout<AudioDeviceID>.size))
-                if st == noErr { usedDevice = match.name }
-            }
-        }
         let format = input.outputFormat(forBus: 0)
         guard format.sampleRate > 0, format.channelCount > 0 else {
             finished = true
+            warm = nil
             return emitError("no-input", "No microphone input is available")
         }
         file = nil
@@ -261,6 +304,7 @@ final class Dictation {
         do { try engine.start() } catch {
             input.removeTap(onBus: 0)
             finished = true
+            warm = nil
             file = nil
             return emitError("audio", "Could not start the microphone: \(error.localizedDescription)")
         }
@@ -291,7 +335,7 @@ final class Dictation {
                 }
             }
         }
-        emit(["type": "started", "onDevice": onDevice, "device": usedDevice, "mode": mode])
+        emit(["type": "started", "onDevice": onDevice, "device": usedDevice, "mode": mode, "ms": Int(Date().timeIntervalSince(startRequested) * 1000)])
     }
 
     // meeting mode: each recognition task covers ~45 s; finished tasks are reported as segments
@@ -331,7 +375,7 @@ final class Dictation {
 
     private func level(_ buffer: AVAudioPCMBuffer) {
         let now = Date().timeIntervalSince1970
-        guard now - lastLevel > 0.05, let data = buffer.floatChannelData?[0] else { return }
+        guard now - lastLevel > 0.06, let data = buffer.floatChannelData?[0] else { return }
         lastLevel = now
         let n = Int(buffer.frameLength)
         guard n > 0 else { return }
@@ -349,6 +393,7 @@ final class Dictation {
         if let engine {
             engine.inputNode.removeTap(onBus: 0)
             engine.stop()
+            engine.prepare() // stays warm for the next key-down; the mic itself is closed
         }
         engine = nil
         file = nil // closes and finalises the WAV header
@@ -409,6 +454,7 @@ func postCommandKey(_ key: CGKeyCode) {
         e?.setIntegerValueField(.eventSourceUserData, value: syntheticMarker)
     }
     down?.post(tap: .cghidEventTap)
+    usleep(5_000)
     up?.post(tap: .cghidEventTap)
 }
 
@@ -420,7 +466,7 @@ func keystroke(_ type: String, _ key: CGKeyCode) {
     emit(["type": type, "ok": true])
 }
 
-// MARK: - Global hotkeys (CGEventTap: modifier-only chords, fn / Globe, hold vs tap)
+// MARK: - Global hotkeys (CGEventTap: modifier-only chords, fn / Globe, mouse buttons, hold vs tap)
 
 let keyNames: [Int: String] = [
     0: "a", 1: "s", 2: "d", 3: "f", 4: "h", 5: "g", 6: "z", 7: "x", 8: "c", 9: "v", 11: "b", 12: "q", 13: "w", 14: "e", 15: "r",
@@ -431,7 +477,14 @@ let keyNames: [Int: String] = [
     105: "f13", 106: "f16", 107: "f14", 109: "f10", 111: "f12", 113: "f15", 114: "help", 115: "home", 116: "pageup", 117: "delete",
     118: "f4", 119: "end", 120: "f2", 121: "pagedown", 122: "f1", 123: "left", 124: "right", 125: "down", 126: "up",
 ]
+let keyCodes: [String: Int] = Dictionary(uniqueKeysWithValues: keyNames.map { ($1, $0) })
+/// keys whose events carry the fn flag even without fn held (arrows, F-keys, navigation)
+let fnFlaggedKeys: Set<Int> = [96, 97, 98, 99, 100, 101, 103, 105, 106, 107, 109, 111, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 64, 79, 80, 90]
+/// other-mouse button number -> name (2 = middle, 3 = back, 4 = forward)
+func mouseName(_ button: Int64) -> String { "mouse\(button + 1)" }
 let modifierOrder = ["fn", "ctrl", "opt", "shift", "cmd"]
+/// physical key codes per modifier, for stale-key checks
+let modifierCodes: [String: [CGKeyCode]] = ["fn": [63, 179], "ctrl": [59, 62], "opt": [58, 61], "shift": [56, 60], "cmd": [55, 54]]
 
 struct Binding {
     let action: String
@@ -441,18 +494,43 @@ struct Binding {
     let when: String?
 }
 
+/// where key state comes from: the real HID state, or a fake one in --selftest
+protocol KeyStateSource {
+    func isKeyDown(_ code: CGKeyCode) -> Bool
+    func isButtonDown(_ button: Int) -> Bool
+    func flags() -> CGEventFlags
+}
+struct HIDKeyState: KeyStateSource {
+    func isKeyDown(_ code: CGKeyCode) -> Bool { CGEventSource.keyState(.combinedSessionState, key: code) }
+    func isButtonDown(_ button: Int) -> Bool { CGMouseButton(rawValue: UInt32(button)).map { CGEventSource.buttonState(.combinedSessionState, button: $0) } ?? false }
+    func flags() -> CGEventFlags { CGEventSource.flagsState(.combinedSessionState) }
+}
+
+func modsFrom(_ f: CGEventFlags, fn: Bool) -> Set<String> {
+    var m: Set<String> = []
+    if fn { m.insert("fn") }
+    if f.contains(.maskControl) { m.insert("ctrl") }
+    if f.contains(.maskAlternate) { m.insert("opt") }
+    if f.contains(.maskShift) { m.insert("shift") }
+    if f.contains(.maskCommand) { m.insert("cmd") }
+    return m
+}
+
 final class Hotkeys {
     var bindings: [Binding] = []
     var context: Set<String> = []
     var recording = false
+    var keyState: KeyStateSource = HIDKeyState()
     private(set) var state = "off" // active (can swallow) | listen (observe only) | off
     private var tap: CFMachPort?
     private var source: CFRunLoopSource?
-    private var mods: Set<String> = []
+    private(set) var mods: Set<String> = []
     private var fnDown = false
-    private var pressed: [String] = []
+    private(set) var pressed: [String] = []
     private var swallowed: Set<String> = []
-    private var activeHold: (action: String, binding: Binding)?
+    private(set) var activeHold: (action: String, binding: Binding)?
+    private var watchdog: Timer?
+    private var staleTicks = 0
 
     func ensureTap() {
         let wantActive = accessibilityTrusted(prompt: false)
@@ -460,7 +538,8 @@ final class Hotkeys {
             if state == "active" || !wantActive { return }
         }
         teardown()
-        let mask: CGEventMask = (1 << CGEventType.keyDown.rawValue) | (1 << CGEventType.keyUp.rawValue) | (1 << CGEventType.flagsChanged.rawValue)
+        var mask: CGEventMask = (1 << CGEventType.keyDown.rawValue) | (1 << CGEventType.keyUp.rawValue) | (1 << CGEventType.flagsChanged.rawValue)
+        mask |= (1 << CGEventType.otherMouseDown.rawValue) | (1 << CGEventType.otherMouseUp.rawValue)
         let callback: CGEventTapCallBack = { _, type, event, _ in
             return hotkeys.handle(type: type, event: event)
         }
@@ -490,14 +569,14 @@ final class Hotkeys {
         source = nil
     }
 
-    func setBindings(_ list: [[String: Any]]) {
+    func setBindings(_ list: [[String: Any]], installTap: Bool = true) {
         bindings = list.compactMap { b in
             guard let action = b["action"] as? String, let keys = b["keys"] as? [String], !keys.isEmpty else { return nil }
             let m = Set(keys.filter { modifierOrder.contains($0) })
             let rest = keys.filter { !modifierOrder.contains($0) }
             return Binding(action: action, mods: m, key: rest.first, hold: b["hold"] as? Bool ?? false, when: b["when"] as? String)
         }
-        ensureTap()
+        if installTap { ensureTap() }
     }
 
     private func applies(_ b: Binding) -> Bool { b.when == nil || context.contains(b.when!) }
@@ -507,77 +586,140 @@ final class Hotkeys {
         emit(["type": "keys", "down": ordered])
     }
 
+    // MARK: stale-key protection (a missed key-up must never leave a hold running or block modifier chords)
+
+    private func physicallyDown(_ name: String) -> Bool {
+        if name.hasPrefix("mouse"), let n = Int(name.dropFirst(5)) { return keyState.isButtonDown(n - 1) }
+        if let code = keyCodes[name] { return keyState.isKeyDown(CGKeyCode(code)) }
+        return true // unknown key: trust the events
+    }
+
+    private func modifierDown(_ m: String) -> Bool {
+        let f = keyState.flags()
+        switch m {
+        case "fn": if f.contains(.maskSecondaryFn) { return true }
+        case "ctrl": if f.contains(.maskControl) { return true }
+        case "opt": if f.contains(.maskAlternate) { return true }
+        case "shift": if f.contains(.maskShift) { return true }
+        case "cmd": if f.contains(.maskCommand) { return true }
+        default: return true
+        }
+        return (modifierCodes[m] ?? []).contains { keyState.isKeyDown($0) }
+    }
+
+    /// drop keys we think are down but are not (their key-up was missed)
+    private func reconcilePressed(except current: String? = nil) {
+        pressed.removeAll { $0 != current && !physicallyDown($0) }
+        swallowed = swallowed.filter { $0 == current || physicallyDown($0) }
+    }
+
+    private func startWatchdog() {
+        guard watchdog == nil else { return }
+        staleTicks = 0
+        let t = Timer(timeInterval: 0.2, repeats: true) { [weak self] _ in self?.checkStale() }
+        RunLoop.main.add(t, forMode: .common)
+        watchdog = t
+    }
+
+    private func stopWatchdog() {
+        watchdog?.invalidate()
+        watchdog = nil
+    }
+
+    /// runs every 200 ms only while a hold is active: if its keys are no longer down for 3 ticks, release it
+    func checkStale() {
+        guard let a = activeHold else { return stopWatchdog() }
+        let b = a.binding
+        let stillDown = b.mods.allSatisfy { modifierDown($0) } && (b.key.map { physicallyDown($0) } ?? true)
+        staleTicks = stillDown ? 0 : staleTicks + 1
+        if staleTicks >= 3 {
+            activeHold = nil
+            stopWatchdog()
+            mods = mods.filter { modifierDown($0) }
+            fnDown = mods.contains("fn")
+            reconcilePressed()
+            emit(["type": "hotkey", "action": a.action, "phase": "up", "stale": true])
+        }
+    }
+
+    private func beginHold(_ b: Binding) {
+        activeHold = (b.action, b)
+        emit(["type": "hotkey", "action": b.action, "phase": "down"])
+        startWatchdog()
+    }
+
+    private func endHold(_ phase: String) {
+        guard let a = activeHold else { return }
+        activeHold = nil
+        stopWatchdog()
+        emit(["type": "hotkey", "action": a.action, "phase": phase])
+    }
+
+    // MARK: event handling
+
     func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             if let t = tap { CGEvent.tapEnable(tap: t, enable: true) }
+            // events were lost while the tap was off: resync with the real key state
+            reconcilePressed()
+            checkStale()
             return Unmanaged.passUnretained(event)
         }
         if event.getIntegerValueField(.eventSourceUserData) == syntheticMarker { return Unmanaged.passUnretained(event) }
         let pass = Unmanaged.passUnretained(event)
-        let canSwallow = state == "active"
+        let swallow = state == "active" ? nil : pass
         let code = Int(event.getIntegerValueField(.keyboardEventKeycode))
 
         switch type {
         case .flagsChanged:
             let f = event.flags
             if code == 63 || code == 179 { fnDown = f.contains(.maskSecondaryFn) }
-            var m: Set<String> = []
-            if fnDown { m.insert("fn") }
-            if f.contains(.maskControl) { m.insert("ctrl") }
-            if f.contains(.maskAlternate) { m.insert("opt") }
-            if f.contains(.maskShift) { m.insert("shift") }
-            if f.contains(.maskCommand) { m.insert("cmd") }
-            mods = m
+            mods = modsFrom(f, fn: fnDown)
             if recording { emitKeys(); return pass }
-            if let a = activeHold, a.binding.key == nil, mods != a.binding.mods {
-                activeHold = nil
-                emit(["type": "hotkey", "action": a.action, "phase": "up"])
-            }
-            if activeHold == nil, pressed.isEmpty, let b = bindings.first(where: { $0.key == nil && $0.hold && $0.mods == mods && applies($0) }) {
-                activeHold = (b.action, b)
-                emit(["type": "hotkey", "action": b.action, "phase": "down"])
+            if let a = activeHold, a.binding.key == nil, mods != a.binding.mods { endHold("up") }
+            if activeHold == nil {
+                reconcilePressed()
+                if pressed.isEmpty, let b = bindings.first(where: { $0.key == nil && $0.hold && $0.mods == mods && applies($0) }) { beginHold(b) }
             }
             return pass
 
-        case .keyDown:
-            let name = keyNames[code] ?? "key\(code)"
-            let repeatKey = event.getIntegerValueField(.keyboardEventAutorepeat) != 0
+        case .keyDown, .otherMouseDown:
+            let isMouse = type == .otherMouseDown
+            let name = isMouse ? mouseName(event.getIntegerValueField(.mouseEventButtonNumber)) : (keyNames[code] ?? "key\(code)")
+            if !isMouse {
+                // key events carry the live modifier flags: use them to fix a missed fn / modifier key-up
+                let f = event.flags
+                if fnDown && !f.contains(.maskSecondaryFn) && !fnFlaggedKeys.contains(code) { fnDown = false }
+                mods = modsFrom(f, fn: fnDown)
+            }
+            let repeatKey = !isMouse && event.getIntegerValueField(.keyboardEventAutorepeat) != 0
             if recording {
                 if !pressed.contains(name) { pressed.append(name) }
                 emitKeys()
-                return canSwallow ? nil : pass
+                return swallow
             }
-            if repeatKey { return swallowed.contains(name) && canSwallow ? nil : pass }
+            if repeatKey { return swallowed.contains(name) ? swallow : pass }
+            reconcilePressed(except: name)
             if !pressed.contains(name) { pressed.append(name) }
             // a modifier-only hold (e.g. fn) followed by another key is a different chord: abort it
-            if let a = activeHold, a.binding.key == nil {
-                activeHold = nil
-                emit(["type": "hotkey", "action": a.action, "phase": "abort"])
-            }
+            if let a = activeHold, a.binding.key == nil { endHold("abort") }
             if let b = bindings.first(where: { $0.key == name && $0.mods == mods && applies($0) }) {
-                if b.hold {
-                    activeHold = (b.action, b)
-                    emit(["type": "hotkey", "action": b.action, "phase": "down"])
-                } else {
-                    emit(["type": "hotkey", "action": b.action, "phase": "press"])
-                }
+                if b.hold { beginHold(b) } else { emit(["type": "hotkey", "action": b.action, "phase": "press"]) }
                 swallowed.insert(name)
-                return canSwallow ? nil : pass
+                return swallow
             }
             return pass
 
-        case .keyUp:
-            let name = keyNames[code] ?? "key\(code)"
+        case .keyUp, .otherMouseUp:
+            let isMouse = type == .otherMouseUp
+            let name = isMouse ? mouseName(event.getIntegerValueField(.mouseEventButtonNumber)) : (keyNames[code] ?? "key\(code)")
             pressed.removeAll { $0 == name }
             if recording {
                 emitKeys()
-                return canSwallow ? nil : pass
+                return swallow
             }
-            if let a = activeHold, a.binding.key == name {
-                activeHold = nil
-                emit(["type": "hotkey", "action": a.action, "phase": "up"])
-            }
-            if swallowed.remove(name) != nil { return canSwallow ? nil : pass }
+            if let a = activeHold, a.binding.key == name { endHold("up") }
+            if swallowed.remove(name) != nil { return swallow }
             return pass
 
         default:
@@ -588,11 +730,166 @@ final class Hotkeys {
     func setRecording(_ on: Bool) {
         recording = on
         pressed = []
-        if on { activeHold = nil }
+        swallowed = []
+        if on, activeHold != nil { endHold("abort") }
+        if on { emitKeys() }
     }
 }
 
 let hotkeys = Hotkeys()
+
+// MARK: - Self test (RoyFlowHelper --selftest): feeds synthetic events through the matcher
+
+final class FakeKeys: KeyStateSource {
+    var keys: Set<CGKeyCode> = []
+    var buttons: Set<Int> = []
+    var flagState: CGEventFlags = []
+    func isKeyDown(_ code: CGKeyCode) -> Bool { keys.contains(code) }
+    func isButtonDown(_ button: Int) -> Bool { buttons.contains(button) }
+    func flags() -> CGEventFlags { flagState }
+}
+
+func runSelfTest() -> Int32 {
+    var out: [[String: Any]] = []
+    emitSink = { out.append($0) }
+    let fake = FakeKeys()
+    let h = Hotkeys()
+    h.keyState = fake
+    h.setBindings([
+        ["action": "ptt", "keys": ["fn"], "hold": true],
+        ["action": "handsfree", "keys": ["opt", "space"], "hold": false],
+        ["action": "cancel", "keys": ["esc"], "hold": false, "when": "recording"],
+        ["action": "pasteLast", "keys": ["ctrl", "cmd", "v"], "hold": false],
+        ["action": "mouse", "keys": ["mouse4"], "hold": false],
+    ], installTap: false)
+    var failures = 0
+    func check(_ name: String, _ cond: Bool) {
+        print((cond ? "ok   " : "FAIL ") + name)
+        if !cond { failures += 1 }
+    }
+    func flags(_ code: Int, _ f: CGEventFlags) {
+        let e = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(code), keyDown: true)!
+        e.type = .flagsChanged
+        e.flags = f
+        _ = h.handle(type: .flagsChanged, event: e)
+    }
+    func key(_ code: Int, _ down: Bool, _ f: CGEventFlags = []) {
+        let e = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(code), keyDown: down)!
+        e.flags = f
+        _ = h.handle(type: down ? .keyDown : .keyUp, event: e)
+    }
+    func mouse(_ button: Int64, _ down: Bool) {
+        let e = CGEvent(mouseEventSource: nil, mouseType: down ? .otherMouseDown : .otherMouseUp, mouseCursorPosition: .zero, mouseButton: .center)!
+        e.setIntegerValueField(.mouseEventButtonNumber, value: button)
+        _ = h.handle(type: down ? .otherMouseDown : .otherMouseUp, event: e)
+    }
+    func hotkeys() -> [String] { out.filter { $0["type"] as? String == "hotkey" }.map { "\($0["action"]!):\($0["phase"]!)" } }
+
+    // 1. fn hold -> ptt down/up
+    fake.keys = [63]; fake.flagState = .maskSecondaryFn
+    flags(63, .maskSecondaryFn)
+    fake.keys = []; fake.flagState = []
+    flags(63, [])
+    check("fn hold starts and ends push-to-talk", hotkeys() == ["ptt:down", "ptt:up"])
+    out = []
+    // 2. fn + another key aborts ptt
+    fake.keys = [63]; fake.flagState = .maskSecondaryFn
+    flags(63, .maskSecondaryFn)
+    fake.keys = [63, 0]
+    key(0, true, .maskSecondaryFn)
+    key(0, false, .maskSecondaryFn)
+    fake.keys = []; fake.flagState = []
+    flags(63, [])
+    check("fn + A aborts push-to-talk", hotkeys() == ["ptt:down", "ptt:abort"])
+    out = []
+    // 3. opt+space press
+    fake.flagState = .maskAlternate; fake.keys = [58]
+    flags(58, .maskAlternate)
+    fake.keys = [58, 49]
+    key(49, true, .maskAlternate)
+    fake.keys = [58]
+    key(49, false, .maskAlternate)
+    fake.keys = []; fake.flagState = []
+    flags(58, [])
+    check("opt+space fires hands-free once", hotkeys() == ["handsfree:press"])
+    out = []
+    // 4. contextual Esc only while recording
+    key(53, true); key(53, false)
+    h.context = ["recording"]
+    key(53, true); key(53, false)
+    h.context = []
+    check("Esc cancels only while recording", hotkeys() == ["cancel:press"])
+    out = []
+    // 5. stale key: A's key-up was missed, fn must still start ptt
+    fake.keys = [0]
+    key(0, true)
+    fake.keys = [] // released, but the key-up never reached the tap
+    fake.keys = [63]; fake.flagState = .maskSecondaryFn
+    flags(63, .maskSecondaryFn)
+    check("missed key-up does not block fn", hotkeys() == ["ptt:down"])
+    // 6. stale hold: fn key-up missed -> watchdog releases after 3 ticks
+    fake.keys = []; fake.flagState = []
+    h.checkStale(); h.checkStale()
+    check("watchdog waits before releasing", hotkeys() == ["ptt:down"])
+    h.checkStale()
+    check("watchdog releases a stale hold", hotkeys() == ["ptt:down", "ptt:up"] && h.activeHold == nil)
+    out = []
+    // 7. held fn survives the watchdog
+    fake.keys = [63]; fake.flagState = .maskSecondaryFn
+    flags(63, .maskSecondaryFn)
+    for _ in 0..<6 { h.checkStale() }
+    check("watchdog keeps a real hold", hotkeys() == ["ptt:down"])
+    fake.keys = []; fake.flagState = []
+    flags(63, [])
+    out = []
+    // 8. missed fn-up recovered from the next key's flags
+    fake.keys = [63]; fake.flagState = .maskSecondaryFn
+    flags(63, .maskSecondaryFn)
+    fake.keys = [0]; fake.flagState = []
+    key(0, true, [])
+    check("next key event clears a stale fn", h.mods.isEmpty && hotkeys() == ["ptt:down", "ptt:abort"])
+    key(0, false, [])
+    out = []
+    // 9. ctrl+cmd+v
+    fake.flagState = [.maskControl, .maskCommand]
+    flags(59, .maskControl); flags(55, [.maskControl, .maskCommand])
+    fake.keys = [9]
+    key(9, true, [.maskControl, .maskCommand]); key(9, false, [.maskControl, .maskCommand])
+    fake.keys = []; fake.flagState = []
+    flags(55, [.maskControl]); flags(59, [])
+    check("ctrl+cmd+V fires paste last", hotkeys() == ["pasteLast:press"])
+    out = []
+    // 10. mouse button 4
+    fake.buttons = [3]
+    mouse(3, true)
+    fake.buttons = []
+    mouse(3, false)
+    check("mouse button 4 fires", hotkeys() == ["mouse:press"])
+    out = []
+    // 11. recording mode reports keys and fires nothing
+    h.setRecording(true)
+    fake.flagState = .maskAlternate
+    flags(58, .maskAlternate)
+    fake.keys = [49]
+    key(49, true, .maskAlternate)
+    let lastKeys = out.last(where: { $0["type"] as? String == "keys" })?["down"] as? [String] ?? []
+    key(49, false, .maskAlternate)
+    fake.keys = []; fake.flagState = []
+    flags(58, [])
+    h.setRecording(false)
+    check("recording reports opt+space live", lastKeys == ["opt", "space"])
+    check("recording does not fire actions", hotkeys().isEmpty)
+    out = []
+    // 12. fn while recording shows fn
+    h.setRecording(true)
+    flags(63, .maskSecondaryFn)
+    let fnKeys = out.last(where: { $0["type"] as? String == "keys" })?["down"] as? [String] ?? []
+    flags(63, [])
+    h.setRecording(false)
+    check("recording captures fn", fnKeys == ["fn"])
+    print(failures == 0 ? "selftest passed" : "selftest: \(failures) failed")
+    return failures == 0 ? 0 : 1
+}
 
 // MARK: - Calendar (EventKit)
 
@@ -685,6 +982,7 @@ func handle(_ line: String) {
     switch cmd {
     case "start":
         dictation.start(locale: obj["locale"] as? String ?? "en-US", device: obj["device"] as? String, mode: obj["mode"] as? String ?? "dictation", record: obj["record"] as? String)
+    case "warm": dictation.prewarm(locale: obj["locale"] as? String ?? "en-US", device: obj["device"] as? String)
     case "stop": dictation.stop()
     case "cancel": dictation.cancel()
     case "paste": keystroke("pasted", 9)
@@ -708,6 +1006,8 @@ func handle(_ line: String) {
     default: emitError("bad-command", "Unknown command \(cmd)")
     }
 }
+
+if selfTestMode { exit(runSelfTest()) }
 
 Thread {
     while let line = readLine() {

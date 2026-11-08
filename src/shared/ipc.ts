@@ -27,6 +27,10 @@ export interface NavRequest {
   page?: string;
   settings?: string;
   modal?: 'help' | 'referral' | 'shortcuts' | null;
+  /** open this meeting on the Notetaker page */
+  meeting?: string;
+  /** open the "Add" dialog on the Dictionary / Snippets page */
+  add?: boolean;
 }
 
 export interface FlowBarConfig {
@@ -104,6 +108,10 @@ export interface SendChannels {
   'scratchpad:open': void;
   'scratchpad:close': void;
   'meeting:toggle': void;
+  /** a button on a Flow Bar notice (e.g. Undo after Esc) */
+  'flowbar:action': string;
+  /** the Flow Bar has more than the pill to show (notes, live text, tips, diff): grow the panel window */
+  'flowbar:expand': boolean;
 }
 
 /** renderer -> main (request/response) */
@@ -145,7 +153,7 @@ export interface EventChannels {
   'store:mutate': StoreMutation;
   'flowbar:config': FlowBarConfig;
   'flowbar:changes': TransformChange;
-  'flowbar:note': { text: string; tone?: 'error' };
+  'flowbar:note': { text: string; tone?: 'error'; action?: { id: string; label: string } };
   'access:changed': AccessStatus;
   'hotkeys:keys': string[];
   'meeting:status': MeetingStatus;
@@ -155,7 +163,7 @@ export interface EventChannels {
   toast: { text: string; tone?: 'success' | 'error' };
 }
 
-export const SEND_CHANNELS: (keyof SendChannels)[] = ['store:patch', 'dictation:toggle', 'dictation:cancel', 'flowbar:interactive', 'flowbar:ready', 'hub:open', 'hotkeys:record', 'scratchpad:open', 'scratchpad:close', 'meeting:toggle'];
+export const SEND_CHANNELS: (keyof SendChannels)[] = ['store:patch', 'dictation:toggle', 'dictation:cancel', 'flowbar:interactive', 'flowbar:ready', 'hub:open', 'hotkeys:record', 'scratchpad:open', 'scratchpad:close', 'meeting:toggle', 'flowbar:action', 'flowbar:expand'];
 export const INVOKE_CHANNELS: (keyof InvokeChannels)[] = [
   'store:load', 'store:export', 'store:reset', 'access:check', 'access:open', 'hotkeys:apply', 'devices:get', 'app:info',
   'ai:status', 'ai:setKey', 'ai:clearKey', 'ai:test', 'ai:cleanup', 'ai:transform', 'ai:ask', 'ai:voice',

@@ -23,10 +23,12 @@ export interface MenuContext {
   openHub(nav?: NavRequest): void;
   toggleDictation(): void;
   toggleMeeting(): void;
+  startMeeting(title: string): void;
   openScratchpad(): void;
   pasteLast(): void;
   copyLast(): void;
-  checkUpdates(): void;
+  version: string;
+  logMetrics(): void;
   setSetting(key: string, value: string | boolean): void;
   quit(): void;
 }
@@ -55,7 +57,7 @@ function pastNotes(c: MenuContext): MenuItemConstructorOptions[] {
     label: truncate(m.title, 40),
     sublabel: fmtDate(m.ts),
     toolTip: m.title,
-    click: () => c.openHub({ page: 'notetaker' }),
+    click: () => c.openHub({ page: 'notetaker', meeting: m.id }),
   }));
   if (items.length) items.push({ type: 'separator' });
   items.push({ label: 'See all past notes', click: () => c.openHub({ page: 'notetaker' }) });
@@ -73,7 +75,11 @@ function upcomingItems(c: MenuContext): MenuItemConstructorOptions[] {
   if (!c.upcoming) return [{ label: 'Connect your calendar…', click: () => c.openHub({ settings: 'connectors' }) }];
   const now = Date.now();
   const next = c.upcoming.filter((e) => e.end > now && !e.allDay).slice(0, 6);
-  const items: MenuItemConstructorOptions[] = next.map((e) => ({ label: truncate(e.title, 40), sublabel: fmtDate(e.start), click: () => c.openHub({ page: 'notetaker' }) }));
+  // a meeting starting within 10 minutes (or under way) starts Notetaker for it; later ones open the Notetaker page
+  const items: MenuItemConstructorOptions[] = next.map((e) => {
+    const soon = e.start - now < 10 * 60_000;
+    return { label: truncate(e.title, 40), sublabel: soon && !c.meetingActive ? `${fmtDate(e.start)} · Start Notetaker` : fmtDate(e.start), click: () => (soon && !c.meetingActive ? c.startMeeting(e.title) : c.openHub({ page: 'notetaker' })) };
+  });
   if (!items.length) items.push({ label: 'No upcoming meetings', enabled: false });
   items.push({ type: 'separator' }, { label: 'See all upcoming meetings', click: () => c.openHub({ page: 'notetaker' }) });
   return items;
@@ -90,8 +96,7 @@ export function buildTrayMenu(c: MenuContext): Menu {
     { label: 'Open Scratchpad', ...accel(c.acc.scratchpad), click: c.openScratchpad },
     { label: 'Open Roy Flow', ...accel(c.acc.openApp), click: () => c.openHub({ page: 'home' }) },
     { type: 'separator' },
-    { label: 'Check for updates...', click: c.checkUpdates },
-    { type: 'separator' },
+
     { label: 'Paste last transcript', ...accel(c.acc.pasteLast), enabled: hasLast, click: c.pasteLast },
     { label: 'Copy last transcript', ...accel(c.acc.copyLast), enabled: hasLast, click: c.copyLast },
     ...lastTranscriptPreview(c),
@@ -100,9 +105,7 @@ export function buildTrayMenu(c: MenuContext): Menu {
     { label: 'Microphone', submenu: micItems(c) },
     { label: 'Languages', submenu: languageItems(c) },
     { type: 'separator' },
-    { label: 'Help center', click: () => c.openHub({ modal: 'help' }) },
-    { label: 'Talk to support', accelerator: 'Command+/', registerAccelerator: false, click: () => c.openHub({ modal: 'help' }) },
-    { label: 'Share feedback', click: () => c.openHub({ modal: 'help' }) },
+    { label: 'Help and feedback…', click: () => c.openHub({ modal: 'help' }) },
     { type: 'separator' },
     { label: 'Quit Roy Flow', accelerator: 'Command+Q', click: c.quit },
   ];
@@ -116,7 +119,7 @@ export function buildAppMenu(c: MenuContext): Menu {
       label: 'Roy Flow',
       submenu: [
         { role: 'about', label: 'About Roy Flow' },
-        { label: 'Check for updates…', click: c.checkUpdates },
+        { label: `Version ${c.version} (local build)`, enabled: false },
         { type: 'separator' },
         { label: 'Settings', accelerator: 'Command+,', click: () => c.openHub({ settings: 'general' }) },
         { type: 'separator' },
@@ -170,8 +173,8 @@ export function buildAppMenu(c: MenuContext): Menu {
         { label: `Dictionary words: ${c.snap.dictionaryCount}`, click: () => c.openHub({ page: 'dictionary' }) },
         { label: `Snippets created: ${c.snap.snippetCount}`, click: () => c.openHub({ page: 'snippets' }) },
         { type: 'separator' },
-        { label: 'Add a word to dictionary', click: () => c.openHub({ page: 'dictionary' }) },
-        { label: 'Create a new snippet', click: () => c.openHub({ page: 'snippets' }) },
+        { label: 'Add a word to dictionary', click: () => c.openHub({ page: 'dictionary', add: true }) },
+        { label: 'Create a new snippet', click: () => c.openHub({ page: 'snippets', add: true }) },
       ],
     },
     {
@@ -182,10 +185,10 @@ export function buildAppMenu(c: MenuContext): Menu {
       label: 'Help',
       role: 'help',
       submenu: [
-        { label: 'Help center', click: () => c.openHub({ modal: 'help' }) },
-        { label: 'Talk to support', accelerator: 'Command+/', click: () => c.openHub({ modal: 'help' }) },
-        { label: 'Share feedback', click: () => c.openHub({ modal: 'help' }) },
+        { label: 'Help and feedback…', click: () => c.openHub({ modal: 'help' }) },
         { label: 'Shortcuts', click: () => c.openHub({ settings: 'general', modal: 'shortcuts' }) },
+        { type: 'separator' },
+        { label: 'Log Resource Usage', click: c.logMetrics },
       ],
     },
     { label: 'Window', role: 'window', submenu: [{ role: 'minimize' }, { role: 'close', label: 'Close Window' }] },

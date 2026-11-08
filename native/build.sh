@@ -7,5 +7,5 @@ swiftc -O -target arm64-apple-macos13 \
   -o build/RoyFlowHelper RoyFlowHelper.swift \
   -framework Speech -framework AVFoundation -framework ApplicationServices -framework CoreAudio -framework AppKit -framework EventKit \
   -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker Info.plist
-codesign --force --sign - --identifier com.royelia.royflow.helper build/RoyFlowHelper
+codesign --force --sign - --identifier com.royelia.royflow.helper -r='designated => identifier "com.royelia.royflow.helper"' build/RoyFlowHelper
 echo "built native/build/RoyFlowHelper"

@@ -16,16 +16,27 @@ export interface HotkeyAction {
   modifierOnly?: boolean;
   /** a single key without modifiers is allowed (Esc) */
   standalone?: boolean;
+  /** the last shortcut cannot be removed (Wispr: push to talk and Cancel) */
+  required?: boolean;
 }
 
 export const MODIFIERS = ['fn', 'ctrl', 'opt', 'shift', 'cmd'] as const;
 export const isModifier = (k: string) => (MODIFIERS as readonly string[]).includes(k);
-export const MAX_CHORDS = 3;
+export const MAX_CHORDS = 4; // per action, as in Wispr Flow
+export const MAX_KEYS = 3; // per chord ("Shortcut must contain 3 or fewer keys")
+/** mouse buttons a shortcut can use: middle (mouse3), back (mouse4), forward (mouse5) and extra buttons */
+export const isMouse = (k: string) => /^mouse([3-9]|10)$/.test(k);
+/** DOM MouseEvent.button -> key name (0 left / 2 right are never shortcuts) */
+export function mouseButtonName(button: number): string | null {
+  if (button === 1) return 'mouse3';
+  if (button >= 3 && button <= 9) return `mouse${button + 1}`;
+  return null;
+}
 
 export const BASE_ACTIONS: HotkeyAction[] = [
-  { id: 'ptt', label: 'Push to talk', desc: 'Hold to dictate, release to paste', hold: true, modifierOnly: true },
+  { id: 'ptt', label: 'Push to talk', desc: 'Hold to dictate, release to paste', hold: true, modifierOnly: true, required: true },
   { id: 'handsfree', label: 'Hands-free mode', desc: 'Press to start dictating, press again to paste' },
-  { id: 'cancel', label: 'Cancel', desc: 'Dismiss the current dictation without pasting', when: 'recording', standalone: true },
+  { id: 'cancel', label: 'Cancel', desc: 'Dismiss the current dictation without pasting', when: 'recording', standalone: true, required: true },
   { id: 'pasteLast', label: 'Paste last transcript', desc: 'Paste your most recent dictation again' },
   { id: 'copyLast', label: 'Copy last transcript', desc: 'Copy your most recent dictation to the clipboard' },
   { id: 'scratchpad', label: 'Open Scratchpad', desc: 'Open the Scratchpad window' },
@@ -100,6 +111,7 @@ const WORD: Record<string, string> = { ctrl: 'Ctrl', opt: 'Opt', shift: 'Shift',
 /** label for one key chip, e.g. "⌥ Opt", "Space", "V" */
 export function keyChip(k: string): string {
   if (WORD[k]) return `${GLYPH[k]} ${WORD[k]}`;
+  if (isMouse(k)) return k === 'mouse3' ? 'Middle click' : `Mouse ${k.slice(5)}`;
   if (GLYPH[k]) return GLYPH[k];
   return /^f\d+$/.test(k) ? k.toUpperCase() : k.length === 1 ? k.toUpperCase() : k;
 }
@@ -144,27 +156,52 @@ export function codeToKeyName(code: string): string | null {
   return m[code] ?? null;
 }
 
-const BLOCKED = new Set(['cmd+q', 'cmd+w', 'cmd+tab', 'cmd+space', 'cmd+c', 'cmd+v', 'cmd+x', 'cmd+z', 'cmd+a', 'cmd+s', 'shift+cmd+3', 'shift+cmd+4', 'shift+cmd+5', 'ctrl+cmd+q', 'ctrl+cmd+space']);
+/** combos macOS or every app relies on (Wispr's blocked set, macOS flavour) */
+const BLOCKED = new Set([
+  ...'cvxzrafghmnopstwq,'.split('').map((k) => `cmd+${k}`),
+  'shift+cmd+z', 'cmd+tab', 'shift+cmd+tab', 'cmd+space', 'ctrl+cmd+space', 'ctrl+cmd+q', 'ctrl+cmd+f', 'opt+cmd+esc',
+  'shift+cmd+3', 'shift+cmd+4', 'shift+cmd+5', 'cmd+`', 'cmd+left', 'cmd+right', 'cmd+up', 'cmd+down', 'opt+cmd+d',
+]);
+/** combos macOS uses by default but that can be turned off: allowed, with a warning */
+const RESERVED_SOFT: Record<string, string> = {
+  'ctrl+space': 'macOS uses ⌃ Space to switch input sources. Turn that off in System Settings › Keyboard › Keyboard Shortcuts › Input Sources.',
+  'ctrl+opt+space': 'macOS uses ⌃⌥ Space for the next input source. Turn that off in Keyboard Shortcuts › Input Sources.',
+  'ctrl+up': 'macOS uses ⌃↑ for Mission Control. Turn that off in Keyboard Shortcuts › Mission Control.',
+  'ctrl+down': 'macOS uses ⌃↓ for App Exposé. Turn that off in Keyboard Shortcuts › Mission Control.',
+  'ctrl+left': 'macOS uses ⌃← to move between Spaces.',
+  'ctrl+right': 'macOS uses ⌃→ to move between Spaces.',
+  'opt+cmd+space': 'macOS uses ⌥⌘ Space to open a Finder search window.',
+};
+const PRINTABLE = /^([a-z0-9]|[-=[\]\\;',./`]|space|return|tab|backspace)$/;
 
-/** validate a chord for an action; returns an error message, or null when it can be used */
+/** validate a chord for an action; returns an error message (Wispr Flow's wording where it has one), or null */
 export function validateChord(action: HotkeyAction, chord: Chord, map: HotkeyMap, actions: HotkeyAction[]): string | null {
   const c = normalize(chord);
   const keys = c.filter((k) => !isModifier(k));
   const mods = c.filter(isModifier);
+  const mouse = keys.some(isMouse);
   if (!c.length) return 'Press at least one key';
-  if (c.length > 4) return 'Shortcut must contain 4 or fewer keys';
-  if (keys.length > 1) return 'Use one key plus modifiers';
+  if (c.length > MAX_KEYS) return `Shortcut must contain ${MAX_KEYS} or fewer keys`;
+  if (keys.length > 1) return 'Use one key (or mouse button) plus modifiers';
   if (!keys.length && !action.modifierOnly) return `${action.label} needs a key besides modifiers (for example ⌥ Space)`;
-  if (keys.length && !mods.length && !action.standalone && !/^f\d+$/.test(keys[0])) return 'Shortcut must include a modifier key (fn ⌃ ⌥ ⇧ ⌘)';
-  if (BLOCKED.has(chordId(c))) return `This shortcut is reserved by macOS: ${chordLabel(c)}`;
+  if (BLOCKED.has(chordId(c))) return `This shortcut is not allowed: ${chordLabel(c)} (macOS or most apps use it)`;
+  if (keys.length && !mods.length && !mouse && !action.standalone && !/^f\d+$/.test(keys[0])) return 'Shortcut must include a modifier key or a valid mouse button';
+  // ⇧ + a letter types a capital letter: it would break typing
+  if (keys.length && !mouse && mods.length === 1 && mods[0] === 'shift' && PRINTABLE.test(keys[0])) return `This shortcut is not allowed: ${chordLabel(c)} (it is needed for typing)`;
   const id = chordId(c);
   for (const a of actions) {
     if (a.id === action.id) continue;
     // contextual bindings only clash with each other when their contexts overlap
     if (a.when && action.when && a.when !== action.when) continue;
-    if (bindingsOf(map, a.id).some((x) => chordId(x) === id)) return `Already used by “${a.label}”`;
+    if (bindingsOf(map, a.id).some((x) => chordId(x) === id)) return `This shortcut is already in use by “${a.label}”`;
   }
+  if (bindingsOf(map, action.id).some((x) => chordId(x) === id)) return 'This shortcut is already in use';
   return null;
+}
+
+/** macOS default shortcut this chord collides with (soft: the shortcut is saved, with this warning) */
+export function reservedWarning(chord: Chord): string | null {
+  return RESERVED_SOFT[chordId(chord)] ?? null;
 }
 
 /** soft warning: a hands-free chord that contains a push-to-talk chord */

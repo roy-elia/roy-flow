@@ -1,10 +1,7 @@
 import { useEffect, useState, type ReactNode } from 'react';
 import {
-  ArrowRight,
   Check,
   CircleUserRound,
-  CirclePlay,
-  CloudCheck,
   Copy,
   CreditCard,
   Hash,
@@ -17,12 +14,13 @@ import {
   Users,
 } from 'lucide-react';
 import { resetState, setSetting, setState, toast, useStore } from '../store';
-import { go, openSettings, setNav, useNav, type SettingsTab } from '../nav';
+import { openSettings, setNav, useNav, type SettingsTab } from '../nav';
 import { ConnectorsIcon, McpIcon, NotetakerIcon } from '../components/icons';
 import { Confirm, Dialog, Dropdown, Switch } from '../components/ui';
+import { useCalendar } from '../native/useCalendar';
 import { toggleTheme } from '../components/Shell';
 import { native } from '../native/bridge';
-import { DEFAULT_MIC, LANGUAGES, MODELS, type CalendarState, type McpInfo } from '../shared/ipc';
+import { DEFAULT_MIC, LANGUAGES, MODELS, type McpInfo } from '../shared/ipc';
 import { demoData } from '../seed';
 import { useShortcutLabel } from './ShortcutsEditor';
 
@@ -72,9 +70,7 @@ export default function SettingsModal() {
           </div>
           <div className="set-version">
             <span>Roy Flow v{__APP_VERSION__}</span>
-            <button className="icon-btn" data-tip="Up to date" aria-label="Up to date" onClick={() => toast('This local build does not update itself')}>
-              <CloudCheck size={18} />
-            </button>
+            <span className="muted" data-tip="This local build does not update itself">Local build</span>
           </div>
         </aside>
         <div className="set-content">
@@ -153,11 +149,6 @@ function Select({ k, options, width = 200 }: { k: string; options: string[]; wid
   const v = useStore((s) => s.settings[k] as string);
   return <Dropdown value={v} options={options} onChange={(x) => setSetting(k, x)} width={width} />;
 }
-const Learn = ({ onClick }: { onClick?: () => void }) => (
-  <button className="learn" onClick={onClick ?? (() => toast('Docs are not bundled with this local build'))}>
-    Learn more <ArrowRight size={14} strokeWidth={2.4} />
-  </button>
-);
 
 /* ------------------------------------------------------------------ General */
 function General() {
@@ -337,7 +328,7 @@ function System() {
             desc={
               <>
                 Smart Formatting now lives in the{' '}
-                <button className="link" onClick={() => (setNav({ settings: null }), go('style'))}>
+                <button className="link" onClick={() => setNav({ settings: null, page: 'style', styleTab: 'cleanup' })}>
                   Auto Cleanup
                 </button>{' '}
                 tab.
@@ -390,11 +381,6 @@ function NotetakerSettings() {
   return (
     <Page
       title="Notetaker"
-      action={
-        <button className="btn btn-outline btn-sm" onClick={() => (setNav({ settings: null }), go('notetaker'), toast('Click Start Notetaker to record your next meeting'))}>
-          <CirclePlay size={16} /> Start tutorial
-        </button>
-      }
     >
       <Section title="Meeting detection">
         <Card>
@@ -411,7 +397,7 @@ function NotetakerSettings() {
       </Section>
       <Section title="While Notetaker is active">
         <Card>
-          <Toggle k="hideInCapture" label="Don't show the Flow Bar in screen capture" desc="The Flow Bar stays out of screenshots and screen shares." />
+          <Toggle k="hideInCapture" label="Don't show the Flow Bar in screen capture" desc="The Flow Bar stays out of screenshots and screen shares (at all times, not only while Notetaker records)." />
           <Row
             label="Keyboard shortcut"
             desc={
@@ -442,49 +428,22 @@ function NotetakerSettings() {
 
 /* ------------------------------------------------------------------ Vibe coding */
 function Vibe() {
-  const [setup, setSetup] = useState(false);
   return (
     <Page title="Vibe coding">
       <Card>
-        <Row
-          label="Variable recognition (VS Code, Cursor, Devin)"
+        <Toggle
+          k="codeAware"
+          label="Code-aware dictation"
           desc={
             <>
-              Recognises variable names in your code. <Learn />
+              In code editors and terminals (VS Code, Cursor, Xcode, Zed, Windsurf, JetBrains, Terminal, iTerm, Warp) Roy Flow keeps your words literal: fillers are removed, but nothing is capitalised and no full stop is added, so names like{' '}
+              <code className="code-chip">index.tsx</code> or <code className="code-chip">userId</code> paste as spoken. Your Style choice is not applied there.
             </>
           }
-        >
-          <button className="btn btn-secondary set-btn" onClick={() => setSetup(true)}>
-            Set up
-          </button>
-        </Row>
-        <Row
-          label="File Tagging in Chat (Cursor & Devin)"
-          desc={
-            <>
-              Tags files in your IDE (like <code className="code-chip">index.tsx</code>).
-              <br />
-              <Learn />
-            </>
-          }
-        >
-          <ToggleOnly k="fileTagging" />
-        </Row>
+        />
       </Card>
-      {setup && (
-        <Dialog title="Set up variable recognition" subtitle="Two quick steps in your editor:" onClose={() => setSetup(false)} actions={<button className="btn btn-primary" onClick={() => setSetup(false)}>Done</button>}>
-          <ol className="steps">
-            <li>Open your editor's settings and search for “Screen Reader Optimized”.</li>
-            <li>Turn it on, then restart the editor so Roy Flow can read symbol names.</li>
-          </ol>
-        </Dialog>
-      )}
     </Page>
   );
-}
-function ToggleOnly({ k }: { k: string }) {
-  const v = useStore((s) => !!s.settings[k]);
-  return <Switch on={v} onChange={(x) => setSetting(k, x)} label={k} />;
 }
 
 /* ------------------------------------------------------------------ Connectors / MCP */
@@ -493,22 +452,6 @@ const Logo = ({ l, c }: { l: string; c: string }) => (
     {l}
   </span>
 );
-
-export function useCalendar(): [CalendarState | null, (request: boolean) => Promise<CalendarState | null>] {
-  const [cal, setCal] = useState<CalendarState | null>(null);
-  useEffect(() => {
-    if (!native) return;
-    native.invoke('calendar:get', { request: false }).then(setCal);
-    return native.on('calendar:changed', setCal);
-  }, []);
-  const refresh = async (request: boolean) => {
-    if (!native) return null;
-    const c = await native.invoke('calendar:get', { request });
-    setCal(c);
-    return c;
-  };
-  return [cal, refresh];
-}
 
 const CAL = [
   { k: 'connected_gcal', name: 'Google Calendar', l: 'G', c: '#7aa7e0' },
@@ -817,7 +760,7 @@ function Account() {
         </div>
         <div className="set-row" style={{ gap: 12 }}>
           <label className="tf-field" style={{ flex: 1 }}>
-            <span className="set-label">Email (optional, used in snippets you write)</span>
+            <span className="set-label">Email (optional). Snippets can insert it with {'{email}'}, and your name with {'{name}'}</span>
             <input className="field" value={email} onChange={(e) => setEmail(e.target.value)} />
           </label>
         </div>

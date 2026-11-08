@@ -15,6 +15,10 @@ export class Helper extends EventEmitter {
     super();
   }
 
+  get pid(): number | undefined {
+    return this.proc?.pid;
+  }
+
   get available() {
     return existsSync(this.bin);
   }

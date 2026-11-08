@@ -1,6 +1,6 @@
-import { Bell, Check, CircleHelp, CircleUserRound, Gift, Mic, Moon, PanelLeft, Scissors, Settings, Sun, Users, WandSparkles } from 'lucide-react';
+import { Bell, Check, CircleHelp, CircleUserRound, Gift, Mic, Moon, PanelLeft, Scissors, Settings, Sun, WandSparkles } from 'lucide-react';
 import { useState, type ReactNode } from 'react';
-import { setState, useStore } from '../store';
+import { setState, useStats, useStore, type State } from '../store';
 import { go, openSettings, setNav, useNav, type PageId } from '../nav';
 import { DictionaryIcon, Glyph, InsightsIcon, NotetakerIcon, ScratchpadIcon, StyleIcon } from './icons';
 import { useClickOutside } from './ui';
@@ -14,7 +14,21 @@ export function toggleTheme() {
   window.setTimeout(() => delete html.dataset.themeTransition, 260);
 }
 
+/** the bell: real items from your own data (streak, words, meeting notes waiting) */
+function useNotifications(): { title: string; body: string }[] {
+  const stats = useStats();
+  const meetings = useStore((s) => s.meetings);
+  const out: { title: string; body: string }[] = [];
+  if (stats.streak > 0) out.push({ title: `${stats.streak} day streak`, body: stats.streak > 1 ? 'Dictate today to keep it going.' : 'Dictate tomorrow to start a streak.' });
+  if (stats.words > 0) out.push({ title: `${stats.words.toLocaleString('en-US')} words dictated`, body: `Across ${stats.dictations.toLocaleString('en-US')} dictations${stats.wpm ? `, about ${stats.wpm} words per minute` : ''}.` });
+  const pending = meetings.filter((m) => !m.demo && (m.summaryStatus === 'nokey' || m.summaryStatus === 'error')).length;
+  if (pending) out.push({ title: `${pending} meeting note${pending > 1 ? 's' : ''} without a summary`, body: 'Open Notetaker to summarise them.' });
+  if (!out.length) out.push({ title: 'Welcome to Roy Flow', body: 'Hold your shortcut in any app and speak.' });
+  return out;
+}
+
 export function TitleBar() {
+  const notes = useNotifications();
   const theme = useStore((s) => s.theme);
   const user = useStore((s) => s.user);
   const open = useStore((s) => s.sidebarOpen);
@@ -50,14 +64,12 @@ export function TitleBar() {
         {pop === 'bell' && (
           <div className="menu popover" style={{ top: 44, right: 50, width: 320 }}>
             <div className="pop-head">Notifications</div>
-            <div className="pop-item">
-              <b>2 day streak</b>
-              <span className="muted">Keep dictating tomorrow to extend it.</span>
-            </div>
-            <div className="pop-item">
-              <b>Welcome to Roy Flow</b>
-              <span className="muted">Hold your shortcut anywhere and speak.</span>
-            </div>
+            {notes.map((n) => (
+              <div className="pop-item" key={n.title}>
+                <b>{n.title}</b>
+                <span className="muted">{n.body}</span>
+              </div>
+            ))}
           </div>
         )}
         {pop === 'account' && (
@@ -95,18 +107,20 @@ const NAV: { id: PageId; label: string; icon: ReactNode }[] = [
   { id: 'scratchpad', label: 'Scratchpad', icon: <ScratchpadIcon /> },
 ];
 
-const STEPS = [
-  { id: 'try', label: 'Try Notetaker', run: () => go('notetaker') },
-  { id: 'calendar', label: 'Connect calendar', run: () => openSettings('connectors') },
-  { id: 'import', label: 'Import your past meetings', run: () => openSettings('notetaker') },
-  { id: 'mcp', label: 'Set up MCP', run: () => openSettings('mcp') },
+/** "Get started": each step is ticked when it has actually been done */
+const STEPS: { id: string; label: string; run: () => void; done: (s: State) => boolean }[] = [
+  { id: 'dictate', label: 'Dictate into another app', run: () => go('home'), done: (s) => s.history.some((h) => h.status === 'ok' && !!h.app) },
+  { id: 'try', label: 'Record a Notetaker note', run: () => go('notetaker'), done: (s) => s.meetings.some((m) => !m.demo) },
+  { id: 'calendar', label: 'Connect calendar', run: () => openSettings('connectors'), done: (s) => !!(s.settings.connected_gcal || s.settings.connected_outlook) },
+  { id: 'mcp', label: 'Set up MCP', run: () => openSettings('mcp'), done: (s) => !!s.checklist.mcp },
 ];
 
 export function Sidebar() {
   const page = useNav((n) => n.page);
   const open = useStore((s) => s.sidebarOpen);
-  const checklist = useStore((s) => s.checklist);
-  const done = STEPS.filter((s) => checklist[s.id]).length;
+  const doneIds = useStore((s) => STEPS.filter((x) => x.done(s)).map((x) => x.id).join(','));
+  const checklist: Record<string, boolean> = Object.fromEntries(doneIds.split(',').filter(Boolean).map((id) => [id, true]));
+  const done = Object.keys(checklist).length;
   return (
     <aside className={`sidebar ${open ? '' : 'collapsed'}`} aria-label="Sidebar">
       <div>
@@ -140,7 +154,7 @@ export function Sidebar() {
       <div className="bottom-section">
         {done < STEPS.length && (
           <div className="side-card">
-            <h4>Set up Notetaker</h4>
+            <h4>Get started</h4>
             <div className="progress">
               <div style={{ width: `${Math.max(8, (done / STEPS.length) * 100)}%` }} />
             </div>
@@ -149,7 +163,8 @@ export function Sidebar() {
                 key={s.id}
                 className="check-row"
                 onClick={() => {
-                  setState((st) => ({ checklist: { ...st.checklist, [s.id]: true } }));
+                  // opening the MCP page is the whole step (copy the command or add it to Claude there)
+                  if (s.id === 'mcp') setState((st) => ({ checklist: { ...st.checklist, mcp: true } }));
                   s.run();
                 }}
               >
@@ -161,12 +176,6 @@ export function Sidebar() {
         )}
         <div className="side-divider" />
         <ul className="nav bottom-nav">
-          <li>
-            <button className="nav-item" onClick={() => openSettings('team')}>
-              <Users size={18} />
-              <span className="nav-label">Invite your team</span>
-            </button>
-          </li>
           <li>
             <button className="nav-item" onClick={() => setNav({ modal: 'referral' })}>
               <Gift size={18} />

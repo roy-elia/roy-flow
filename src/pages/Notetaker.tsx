@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowLeft, ArrowUp, ArrowUpRight, CalendarDays, ChevronDown, ChevronUp, FileText, Folder, MessageSquare, Plus, RotateCw, Search, Settings, Trash2, X } from 'lucide-react';
 import { setSetting, setState, toast, uid, useStore, type Chat, type ChatMessage, type Meeting } from '../store';
-import { openSettings } from '../nav';
+import { openSettings, setNav, useNav } from '../nav';
 import { Confirm, Tabs } from '../components/ui';
 import { NotetakerIcon } from '../components/icons';
 import { native } from '../native/bridge';
-import { useCalendar } from '../settings/SettingsModal';
+import { useCalendar } from '../native/useCalendar';
 import { useShortcutLabel } from '../settings/ShortcutsEditor';
 import type { MeetingStatus } from '../shared/ipc';
 
@@ -92,6 +92,14 @@ export default function Notetaker() {
   const [showChats, setShowChats] = useState(false);
   const [del, setDel] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
+  // a past note picked in the menu bar
+  const navMeeting = useNav((n) => n.meeting ?? null);
+  useEffect(() => {
+    if (!navMeeting) return;
+    setNav({ meeting: null });
+    if (meetings.some((m) => m.id === navMeeting)) setOpen(navMeeting);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [navMeeting]);
   const liveRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -286,7 +294,6 @@ export default function Notetaker() {
               <Tabs
                 tabs={[
                   { id: 'past', label: 'Past notes' },
-                  { id: 'shared', label: 'Shared with me' },
                   { id: 'folders', label: 'Folders' },
                 ]}
                 value={tab}

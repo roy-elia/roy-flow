@@ -1,20 +1,22 @@
-import { useEffect, useState } from 'react';
+import { lazy, Suspense, useEffect, useState } from 'react';
 import { Copy } from 'lucide-react';
 import { toast, useStore } from './store';
 import { setNav, useNav } from './nav';
 import { Sidebar, TitleBar } from './components/Shell';
 import { Dialog, Dropdown, Toasts } from './components/ui';
 import Home from './pages/Home';
-import Notetaker from './pages/Notetaker';
-import Insights from './pages/Insights';
-import { Dictionary, Snippets } from './pages/Lists';
-import Style from './pages/Style';
-import Transforms from './pages/Transforms';
 import Scratchpad, { ScratchpadWindow } from './pages/Scratchpad';
-import SettingsModal from './settings/SettingsModal';
-import ShortcutsDialog from './settings/ShortcutsEditor';
-import FlowBar from './flowbar/FlowBar';
 import HubBridge from './native/HubBridge';
+// pages and dialogs other than Home load on first use (smaller start-up, less memory in the hub renderer)
+const Notetaker = lazy(() => import('./pages/Notetaker'));
+const Insights = lazy(() => import('./pages/Insights'));
+const Dictionary = lazy(() => import('./pages/Lists').then((m) => ({ default: m.Dictionary })));
+const Snippets = lazy(() => import('./pages/Lists').then((m) => ({ default: m.Snippets })));
+const Style = lazy(() => import('./pages/Style'));
+const Transforms = lazy(() => import('./pages/Transforms'));
+const SettingsModal = lazy(() => import('./settings/SettingsModal'));
+const ShortcutsDialog = lazy(() => import('./settings/ShortcutsEditor'));
+const FlowBar = lazy(() => import('./flowbar/FlowBar'));
 import AccessBanner from './native/AccessBanner';
 import { isElectron } from './native/bridge';
 
@@ -22,6 +24,7 @@ export default function App() {
   const theme = useStore((s) => s.theme);
   const page = useNav((n) => n.page);
   const modal = useNav((n) => n.modal);
+  const settingsOpen = useNav((n) => !!n.settings);
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
   }, [theme]);
@@ -31,6 +34,7 @@ export default function App() {
       <AccessBanner />
       <div className="app-body">
         <Sidebar />
+        <Suspense fallback={<div className="page" />}>
         {page === 'home' && <Home />}
         {page === 'notetaker' && <Notetaker />}
         {page === 'insights' && <Insights />}
@@ -39,14 +43,22 @@ export default function App() {
         {page === 'style' && <Style />}
         {page === 'transforms' && <Transforms />}
         {page === 'scratchpad' && <Scratchpad />}
+        </Suspense>
       </div>
       <ScratchpadWindow />
       {/* in the desktop app the Flow Bar lives in its own always-on-top panel window */}
-      {isElectron ? <HubBridge /> : <FlowBar />}
-      <SettingsModal />
+      {/* one boundary each, so a dialog loading for the first time never hides another one */}
+      {isElectron ? (
+        <HubBridge />
+      ) : (
+        <Suspense fallback={null}>
+          <FlowBar />
+        </Suspense>
+      )}
+      <Suspense fallback={null}>{settingsOpen && <SettingsModal />}</Suspense>
+      <Suspense fallback={null}>{modal === 'shortcuts' && <ShortcutsDialog onClose={() => setNav({ modal: null })} />}</Suspense>
       {modal === 'help' && <HelpDialog />}
       {modal === 'referral' && <ReferralDialog />}
-      {modal === 'shortcuts' && <ShortcutsDialog onClose={() => setNav({ modal: null })} />}
       <Toasts />
     </div>
   );
@@ -58,8 +70,8 @@ function HelpDialog() {
   const close = () => setNav({ modal: null });
   return (
     <Dialog
-      title="Contact support"
-      subtitle="Tell us what went wrong or what you would love to see."
+      title="Help and feedback"
+      subtitle="Roy Flow is a local app with no support service. Write your note here and save it as a text file to keep or send."
       onClose={close}
       width={520}
       actions={
@@ -71,11 +83,11 @@ function HelpDialog() {
             a.href = URL.createObjectURL(new Blob([`Type: ${type}\n\n${msg}`], { type: 'text/plain' }));
             a.download = 'roy-flow-feedback.txt';
             a.click();
-            toast('Feedback saved as a text file');
+            toast('Saved roy-flow-feedback.txt to Downloads');
             close();
           }}
         >
-          Send message
+          Save as text file
         </button>
       }
     >

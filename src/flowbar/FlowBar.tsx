@@ -5,6 +5,7 @@ import { go, setNav } from '../nav';
 import { NotetakerIcon, ScratchpadIcon } from '../components/icons';
 import { appendToOpenNote, newNote } from '../pages/Scratchpad';
 import { runTransform } from '../pages/Transforms';
+import './flowbar.css';
 
 type BarState = 'resting' | 'ready' | 'recording' | 'processing' | 'polishing';
 interface Note {

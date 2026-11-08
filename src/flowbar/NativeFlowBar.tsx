@@ -11,6 +11,7 @@ type Look = 'resting' | 'ready' | 'recording' | 'processing';
 interface Note {
   text: string;
   tone?: 'error';
+  action?: { id: string; label: string };
 }
 const BARS = 10;
 const withKey = (text: string, key: string) => (key ? `${text} (${key})` : text);
@@ -71,7 +72,7 @@ export default function NativeFlowBar() {
         if (r.note) notify({ text: r.note, tone: 'error' }, 6000);
         else notify(r.pasted ? { text: `Pasted: “${short}”` } : { text: r.reason ?? 'Copied to the clipboard' }, r.pasted ? 3000 : 6000);
       }),
-      native.on('flowbar:note', (n) => notify(n, n.tone === 'error' ? 6000 : 4000)),
+      native.on('flowbar:note', (n) => notify(n, n.action ? 6000 : n.tone === 'error' ? 6000 : 4000)),
       native.on('flowbar:changes', (c) => {
         setNote(null);
         setChanges(c);
@@ -108,6 +109,12 @@ export default function NativeFlowBar() {
     };
   }, []);
 
+  // grow the panel window only while there is more than the pill to draw
+  const expanded = !!(changes || note || tip || (phase === 'recording' && (interim || cfg.creatorMode)) || (phase === 'processing' && kindLabel));
+  useEffect(() => {
+    native?.send('flowbar:expand', expanded);
+  }, [expanded]);
+
   const look: Look = phase === 'recording' ? 'recording' : phase === 'processing' ? 'processing' : hover ? 'ready' : 'resting';
   const side = cfg.dock !== 'bottom';
   const toggle = () => native?.send('dictation:toggle');
@@ -138,6 +145,18 @@ export default function NativeFlowBar() {
       {note && !changes && (
         <div className={`fb-note ${note.tone === 'error' ? 'error' : ''}`} role="status" data-interactive onClick={() => setNote(null)}>
           <span>{note.text}</span>
+          {note.action && (
+            <button
+              className="fb-note-action"
+              onClick={(e) => {
+                e.stopPropagation();
+                native?.send('flowbar:action', note.action!.id);
+                setNote(null);
+              }}
+            >
+              {note.action.label}
+            </button>
+          )}
         </div>
       )}
       {phase === 'recording' && interim && <div className="fb-live">{interim}</div>}
