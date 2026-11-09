@@ -57,6 +57,10 @@
         "to": "RoyFlowHelper"
       },
       {
+        "from": "vendor/whisper/whisper-server",
+        "to": "whisper/whisper-server"
+      },
+      {
         "from": "resources",
         "to": "tray",
         "filter": [

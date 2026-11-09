@@ -12,6 +12,8 @@ export interface DictationStatus {
   /** what is running: a dictation, or a Transform on selected text */
   kind?: 'dictation' | 'transform';
   label?: string;
+  /** a line under the pill while processing a dictation (e.g. "Loading speech model…") */
+  detail?: string;
 }
 
 export interface DictationResult {
@@ -92,6 +94,25 @@ export interface McpInfo {
   running: boolean;
 }
 
+/** the local Whisper engine (Settings › General › Speech engine) */
+export interface WhisperStatus {
+  model: 'missing' | 'downloading' | 'ready';
+  /** Core ML encoder present (Neural Engine); without it whisper-server uses Metal only */
+  coreml: boolean;
+  /** whisper-server shipped in the app */
+  binary: boolean;
+  /** preparing = first start, compiling the Core ML encoder for this Mac (minutes); starting = loading (seconds) */
+  server: 'stopped' | 'preparing' | 'starting' | 'running' | 'error';
+  download?: { phase: 'model' | 'coreml'; done: number; total: number };
+  error?: string;
+  modelsDir: string;
+}
+
+export const SPEECH_ENGINES = { whisper: 'Whisper (on this Mac)', apple: 'Apple Speech' } as const;
+export type SpeechEngine = keyof typeof SPEECH_ENGINES;
+/** memory saver: unload the Whisper model after this long without a dictation */
+export const UNLOAD_OPTIONS: Record<string, number> = { 'After 5 min': 5, 'After 15 min': 15, 'After 60 min': 60, 'Keep loaded': 0 };
+
 export type StoreMutation =
   | { collection: 'history' | 'meetings'; op: 'add'; item: HistoryItem | Meeting }
   | { collection: 'history' | 'meetings'; op: 'patch'; id: string; patch: Partial<HistoryItem> & Partial<Meeting> };
@@ -141,6 +162,10 @@ export interface InvokeChannels {
   'mcp:info': { args: void; result: McpInfo };
   'mcp:addClaude': { args: void; result: { ok: boolean; cancelled?: boolean; error?: string } };
   'notify:test': { args: void; result: void };
+  'whisper:status': { args: void; result: WhisperStatus };
+  'whisper:download': { args: void; result: { ok: boolean; error?: string } };
+  /** names of the apps in /Applications, /System/Applications and ~/Applications (Focus Mode picker) */
+  'apps:installed': { args: void; result: string[] };
 }
 
 /** main -> renderer */
@@ -163,6 +188,7 @@ export interface EventChannels {
   'ai:chunk': { id: string; delta: string };
   'ai:done': { id: string; error?: string };
   toast: { text: string; tone?: 'success' | 'error' };
+  'whisper:status': WhisperStatus;
 }
 
 export const SEND_CHANNELS: (keyof SendChannels)[] = ['store:patch', 'dictation:toggle', 'dictation:cancel', 'flowbar:interactive', 'flowbar:ready', 'hub:open', 'hotkeys:record', 'scratchpad:open', 'scratchpad:close', 'meeting:toggle', 'flowbar:action', 'flowbar:expand'];
@@ -170,10 +196,11 @@ export const INVOKE_CHANNELS: (keyof InvokeChannels)[] = [
   'store:load', 'store:export', 'store:reset', 'access:check', 'access:open', 'hotkeys:apply', 'devices:get', 'app:info',
   'ai:status', 'ai:setKey', 'ai:clearKey', 'ai:test', 'ai:cleanup', 'ai:transform', 'ai:ask', 'ai:voice',
   'meeting:summarize', 'meeting:start', 'meeting:stop', 'audio:get', 'audio:extract', 'calendar:get', 'mcp:info', 'mcp:addClaude', 'notify:test',
+  'whisper:status', 'whisper:download', 'apps:installed',
 ];
 export const EVENT_CHANNELS: (keyof EventChannels)[] = [
   'nav', 'dictation:status', 'dictation:level', 'dictation:result', 'store:changed', 'store:mutate', 'flowbar:config', 'flowbar:changes', 'flowbar:mic',
-  'flowbar:note', 'access:changed', 'hotkeys:keys', 'meeting:status', 'calendar:changed', 'ai:chunk', 'ai:done', 'toast',
+  'flowbar:note', 'access:changed', 'hotkeys:keys', 'meeting:status', 'calendar:changed', 'ai:chunk', 'ai:done', 'toast', 'whisper:status',
 ];
 
 export interface RoyFlowBridge {

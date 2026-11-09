@@ -20,7 +20,7 @@ import { Confirm, Dialog, Dropdown, Switch } from '../components/ui';
 import { useCalendar } from '../native/useCalendar';
 import { toggleTheme } from '../components/Shell';
 import { native } from '../native/bridge';
-import { DEFAULT_MIC, LANGUAGES, MODELS, type McpInfo } from '../shared/ipc';
+import { DEFAULT_MIC, LANGUAGES, MODELS, SPEECH_ENGINES, UNLOAD_OPTIONS, type McpInfo, type WhisperStatus } from '../shared/ipc';
 import { demoData } from '../seed';
 import { useShortcutLabel } from './ShortcutsEditor';
 
@@ -145,7 +145,7 @@ function Toggle({ k, label, desc }: { k: string; label: ReactNode; desc?: ReactN
     </Row>
   );
 }
-function Select({ k, options, width = 200 }: { k: string; options: string[]; width?: number }) {
+function Select({ k, options, width = 200 }: { k: string; options: (string | { value: string; label: string })[]; width?: number }) {
   const v = useStore((s) => s.settings[k] as string);
   return <Dropdown value={v} options={options} onChange={(x) => setSetting(k, x)} width={width} />;
 }
@@ -203,6 +203,15 @@ function General() {
             Change
           </button>
         </Row>
+        <Row label="Speech engine" desc="Whisper runs on this Mac with your dictionary as a hint. Apple Speech shows live text while you speak. Notetaker always uses Apple Speech.">
+          <Select k="engine" options={Object.entries(SPEECH_ENGINES).map(([value, label]) => ({ value, label }))} width={220} />
+        </Row>
+        {s.engine !== 'apple' && <WhisperModel />}
+        {s.engine !== 'apple' && (
+          <Row label="Memory saver" desc="Unloads the Whisper model when you have not dictated for a while. It reloads in about 2 s when you start dictating.">
+            <Select k="unloadModel" options={Object.keys(UNLOAD_OPTIONS)} width={165} />
+          </Row>
+        )}
         <Row label="Theme">
           <Dropdown
             value={theme}
@@ -220,6 +229,93 @@ function General() {
         <PickDialog title="Languages" sub="Select the language you speak for better accuracy." options={LANGUAGES} value={s.language as string} onPick={(v) => setSetting('language', v)} onClose={() => setDlg(null)} />
       )}
     </Page>
+  );
+}
+
+const mb = (n: number) => (n >= 1e9 ? `${(n / 1e9).toFixed(1)} GB` : `${Math.round(n / 1e6)} MB`);
+
+/** Whisper model status, download with progress, and what happens while it is missing */
+function WhisperModel() {
+  const [st, setSt] = useState<WhisperStatus | null>(null);
+  const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    if (!native) return;
+    void native.invoke('whisper:status').then(setSt);
+    return native.on('whisper:status', setSt);
+  }, []);
+  if (!native) return <Row label="Whisper model" desc="Available in the Roy Flow desktop app." />;
+  if (!st) return null;
+  const download = async () => {
+    setBusy(true);
+    const r = await native!.invoke('whisper:download');
+    setBusy(false);
+    toast(r.ok ? 'Whisper model downloaded' : (r.error ?? 'Download failed'), r.ok ? {} : { tone: 'error' });
+  };
+  let desc: ReactNode;
+  if (!st.binary) desc = 'whisper-server is missing from this build, so dictation uses Apple Speech.';
+  else if (st.model === 'downloading' && st.download) {
+    const { phase, done, total } = st.download;
+    desc = (
+      <>
+        Downloading {phase === 'coreml' ? 'the Neural Engine encoder' : 'large-v3-turbo'}… {total ? `${mb(done)} of ${mb(total)}` : mb(done)}
+        <div className="progress" style={{ margin: '6px 0 0', width: 260 }}>
+          <div style={{ width: `${total ? Math.round((done / total) * 100) : 5}%` }} />
+        </div>
+      </>
+    );
+  } else if (st.model === 'missing') desc = 'Not downloaded (about 1.7 GB). Until it is, dictation uses Apple Speech.';
+  else {
+    const server: Record<WhisperStatus['server'], string> = {
+      stopped: 'unloaded to save memory, loads when you dictate',
+      preparing: 'preparing the speech model for this Mac (one time, a few minutes); Apple Speech is used until then',
+      starting: 'loading…',
+      running: 'loaded',
+      error: `could not start${st.error ? `: ${st.error}` : ''}`,
+    };
+    desc = `large-v3-turbo${st.coreml ? ' with Neural Engine encoder' : ' (Metal)'} · ${server[st.server]}`;
+  }
+  return (
+    <Row label="Whisper model" desc={desc}>
+      {st.binary && st.model !== 'ready' && (
+        <button className="btn btn-secondary set-btn" disabled={busy || st.model === 'downloading'} onClick={download}>
+          {st.model === 'downloading' ? 'Downloading…' : 'Download'}
+        </button>
+      )}
+    </Row>
+  );
+}
+
+/** Focus Mode: the apps hidden while they are frontmost (stored one name per line) */
+function FocusApps() {
+  const list = useStore((s) => String(s.settings.focusApps ?? ''));
+  const chosen = list.split('\n').map((x) => x.trim()).filter(Boolean);
+  const [open, setOpen] = useState(false);
+  const [apps, setApps] = useState<string[]>([]);
+  useEffect(() => {
+    if (open && native) void native.invoke('apps:installed').then(setApps);
+  }, [open]);
+  const toggle = (name: string) => {
+    const next = chosen.includes(name) ? chosen.filter((x) => x !== name) : [...chosen, name].sort((a, b) => a.localeCompare(b));
+    setSetting('focusApps', next.join('\n'));
+  };
+  return (
+    <Row label="Apps to hide" desc={chosen.length ? chosen.join(', ') : 'No apps chosen yet'}>
+      <button className="btn btn-secondary set-btn" onClick={() => setOpen(true)} disabled={!native}>
+        Choose
+      </button>
+      {open && (
+        <Dialog title="Apps to hide" subtitle="While Focus Mode is on, these apps are hidden as soon as they come to the front." onClose={() => setOpen(false)} width={460}>
+          <div className="pick-list">
+            {[...new Set([...chosen, ...apps])].sort((a, b) => a.localeCompare(b)).map((o) => (
+              <button key={o} className={`menu-item ${chosen.includes(o) ? 'selected' : ''}`} onClick={() => toggle(o)}>
+                {o}
+                {chosen.includes(o) && <Check size={16} className="check" />}
+              </button>
+            ))}
+          </div>
+        </Dialog>
+      )}
+    </Row>
   );
 }
 
@@ -322,6 +418,8 @@ function System() {
       <Section title="Extras">
         <Card>
           <Toggle k="autoAddDictionary" label="Auto-add to dictionary" desc="When you correct a word in a transcript on Home, the correction is added to your dictionary" />
+          <Toggle k="autoLearn" label="Learn from my edits" desc="When you fix a name or term right after dictating it into an app, Roy Flow adds the corrected spelling to your dictionary. Password fields are never read." />
+          <Toggle k="offerNewMic" label="Offer to switch to a new microphone" desc="When a microphone is plugged in or connects, the Flow Bar offers to use it" />
           <Toggle k="creatorMode" label="Creator mode" desc='Show "Dictating with Roy Flow" on the Flow Bar while you dictate' />
           <Row
             label="Smart Formatting"
@@ -335,6 +433,12 @@ function System() {
               </>
             }
           />
+        </Card>
+      </Section>
+      <Section title="Focus Mode">
+        <Card>
+          <Toggle k="focusMode" label="Focus Mode" desc="Hides distracting apps whenever they come to the front" />
+          <FocusApps />
         </Card>
       </Section>
       <Section title="Data">

@@ -5,7 +5,7 @@
    Dictation, global hotkeys (CGEventTap), paste/copy, mute, sounds and calendar run in the native helper. */
 import { app, BrowserWindow, clipboard, ClipboardItem, dialog, globalShortcut, ipcMain, Menu, nativeImage, net, Notification, protocol, screen, session as electronSession, shell, Tray, type Rectangle, type WebContents } from 'electron';
 import { execFileSync } from 'node:child_process';
-import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -14,6 +14,9 @@ import { buildAppMenu, buildTrayMenu, type MenuContext, type MenuSnapshot } from
 import * as ai from './ai';
 import { audioDir, audioPath, getData, hasData, loadData, patchData, pruneAudio, saveNow, wipeAll } from './data';
 import { rmSync } from 'node:fs';
+import { migrateModels, WhisperServer } from './whisper';
+import { toWhisperWav } from './wav';
+import { correctionPairs, glossaryPrompt, LEARN_CHECK_AFTER_MS } from '../src/shared/learn';
 import { addToClaude, mcpInfo, startMcpServer, stopMcpServer } from './mcpServer';
 import { applyDictionary, applySnippets, changedWords, cleanUp, styleText, wordCount } from '../src/shared/textPipeline';
 import { allActions, bindingsOf, chordLabel, defaultHotkeyMap, helperBindings, toAccelerator, type HotkeyMap } from '../src/shared/hotkeys';
@@ -34,6 +37,8 @@ import {
   type NavRequest,
   type StoreMutation,
   type TransformChange,
+  UNLOAD_OPTIONS,
+  type WhisperStatus,
 } from '../src/shared/ipc';
 
 const DEV_URL = process.env.ROYFLOW_DEV_URL; // set by `npm run app:dev`
@@ -45,6 +50,10 @@ const RES = app.isPackaged ? process.resourcesPath : APP_ROOT;
 const HELPER_BIN = app.isPackaged ? path.join(process.resourcesPath, 'RoyFlowHelper') : path.join(APP_ROOT, 'native/build/RoyFlowHelper');
 const TRAY_ICON = app.isPackaged ? path.join(RES, 'tray/trayTemplate.png') : path.join(APP_ROOT, 'resources/trayTemplate.png');
 const SOUNDS = app.isPackaged ? path.join(RES, 'sounds') : path.join(APP_ROOT, 'resources/sounds');
+const WHISPER_BIN = app.isPackaged ? path.join(RES, 'whisper/whisper-server') : path.join(APP_ROOT, 'vendor/whisper/whisper-server');
+/** test-only: `ROYFLOW_SELFTEST_WAV=x.wav "Roy Flow.app/Contents/MacOS/Roy Flow"` runs the WAV through the Whisper
+    engine path, logs the transcript and quits (does not touch the running app or its data) */
+const SELFTEST_WAV = process.env.ROYFLOW_SELFTEST_WAV;
 
 const HUB = { width: 1350, height: 850, minWidth: 1140, minHeight: 750 };
 const CSP = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; media-src 'self' blob:; connect-src 'self'";
@@ -52,7 +61,7 @@ const CSP = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inl
 app.setName('Roy Flow');
 protocol.registerSchemesAsPrivileged([{ scheme: 'app', privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true } }]);
 
-if (!app.requestSingleInstanceLock()) {
+if (!SELFTEST_WAV && !app.requestSingleInstanceLock()) {
   app.quit();
 }
 
@@ -411,6 +420,10 @@ interface Final {
   audio: string | null;
   seconds: number;
   via?: string;
+  /** whisper: the helper only recorded; `text` is empty until speechToText() ran */
+  engine?: 'whisper' | 'apple';
+  /** the WAV is a temporary file (history audio is off): delete it once transcribed */
+  temp?: boolean;
 }
 
 /* ---- latency instrumentation: per-dictation timings (never text) to main.log + Help › Show Dictation Timing */
@@ -431,6 +444,8 @@ let session: 'dictation' | 'meeting' | null = null;
 
 function setPhase(p: DictationPhase, extra: Partial<DictationStatus> = {}) {
   if (p !== phase) log('[dictation]', phase, '->', p, extra.error ?? '');
+  if (p !== 'recording') clearCap();
+  if (p === 'idle' && phase !== 'idle') armUnload();
   phase = p;
   if (extra.kind) phaseKind = extra.kind;
   if (p === 'idle') phaseKind = 'dictation';
@@ -447,6 +462,7 @@ function failDictation(message: string) {
 async function startDictation(how: 'toggle' | 'ptt') {
   if (phase === 'recording' || phase === 'processing') return;
   dropCancelled();
+  learnBeforeDictation();
   if (meeting) return failDictation('Notetaker is recording. Stop it before dictating.');
   if (!helper.available) return failDictation('Native helper missing. Run npm run native.');
   interim = '';
@@ -464,19 +480,168 @@ async function startDictation(how: 'toggle' | 'ptt') {
     });
   const mic = setting('microphone', DEFAULT_MIC);
   const keepAudio = setting('localStorage', 'Store normally') !== 'Never store';
-  if (keepAudio) mkdirSync(audioDir(), { recursive: true });
+  const eng = pickEngine();
+  dictEngine = eng.engine;
+  engineNote = eng.note;
+  // prewarm: (re)load the model while the user speaks (memory saver may have unloaded it)
+  if (dictEngine === 'whisper') {
+    clearTimeout(unloadTimer);
+    void whisper.start().catch(() => {});
+  }
+  // Whisper needs the audio even when history audio is off: a temporary file, deleted once transcribed
+  let record = '';
+  if (keepAudio) {
+    mkdirSync(audioDir(), { recursive: true });
+    record = path.join(audioDir(), `${pendingId}.wav`);
+  } else if (dictEngine === 'whisper') record = path.join(app.getPath('temp'), `royflow-${pendingId}.wav`);
   session = 'dictation';
   const ok = helper.send({
     cmd: 'start',
     mode: 'dictation',
     locale: LANGUAGE_LOCALES[setting('language', 'English')] ?? 'en-US',
     device: mic === DEFAULT_MIC ? '' : mic,
-    record: keepAudio ? path.join(audioDir(), `${pendingId}.wav`) : '',
+    record,
+    engine: dictEngine,
   });
   if (!ok) return failDictation('Could not start the native helper');
   sound('start');
   setTimeout(() => phase === 'recording' && mute(true), 280);
   setPhase('recording', { kind: 'dictation' });
+  armCap();
+}
+
+/* ---- 20-minute cap on one dictation, with a warning a minute before (RoyFlow) */
+const MAX_DICTATION_MS = 20 * 60_000;
+const CAP_WARN_MS = 60_000;
+let capTimers: NodeJS.Timeout[] = [];
+function clearCap() {
+  capTimers.forEach(clearTimeout);
+  capTimers = [];
+}
+function armCap() {
+  clearCap();
+  capTimers = [
+    setTimeout(() => phase === 'recording' && notice('1 minute left in this dictation'), MAX_DICTATION_MS - CAP_WARN_MS),
+    setTimeout(() => {
+      if (phase !== 'recording') return;
+      log('[dictation] 20-minute limit reached');
+      void stopDictation().then(() => notice('Dictation stopped at the 20-minute limit'));
+    }, MAX_DICTATION_MS),
+  ];
+}
+
+/* ------------------------------------------------------------------ speech engine (Whisper default, Apple Speech) */
+let whisper!: WhisperServer;
+let dictEngine: 'whisper' | 'apple' = 'apple';
+/** why this dictation fell back to Apple Speech (shown after it is pasted) */
+let engineNote: string | undefined;
+const lastEngineNote = new Map<string, number>();
+const MODELS_DIR = () => path.join(app.getPath('userData'), 'models');
+/** where RoyFlow (the retired app) kept its models */
+const OLD_MODELS_DIR = () => path.join(app.getPath('appData'), 'RoyFlow', 'models');
+
+function initWhisper() {
+  if (whisper) return;
+  // first run: take over the models RoyFlow already downloaded (a rename on the same volume, no copy)
+  migrateModels(OLD_MODELS_DIR(), MODELS_DIR(), undefined, log);
+  let dir = MODELS_DIR();
+  // the move failed (other volume?): use them where they are rather than downloading 1.7 GB again
+  if (!readdirSafe(dir).some((n) => n.endsWith('.bin')) && readdirSafe(OLD_MODELS_DIR()).some((n) => n.endsWith('.bin'))) dir = OLD_MODELS_DIR();
+  whisper = new WhisperServer({ bin: WHISPER_BIN, modelsDir: dir, stateFile: userFile('whisper-state.json'), log });
+  let prev: WhisperStatus['server'] = 'stopped';
+  whisper.on('status', (st: WhisperStatus) => {
+    broadcast('whisper:status', st);
+    if (st.server === prev) return;
+    if (st.server === 'preparing' || (prev === 'preparing' && st.server !== 'stopped')) pinBar(6000);
+    if (st.server === 'preparing') notice('Preparing speech model… This one-time step takes a few minutes; Apple Speech is used until then.');
+    if (prev === 'preparing' && st.server === 'running') notice('Speech model ready');
+    if (prev === 'preparing' && st.server === 'error') notice(`The speech model could not start: ${st.error ?? 'unknown error'}`, 'error');
+    prev = st.server;
+  });
+}
+function readdirSafe(dir: string): string[] {
+  try {
+    return readdirSync(dir);
+  } catch {
+    return [];
+  }
+}
+
+/** the engine for the next dictation: Whisper when chosen and ready to load, else Apple Speech (with the reason) */
+function pickEngine(): { engine: 'whisper' | 'apple'; note?: string } {
+  if (setting('engine', 'whisper') !== 'whisper') return { engine: 'apple' };
+  const st = whisper.status();
+  if (!st.binary) return { engine: 'apple', note: 'Whisper is missing from this build, so Apple Speech was used.' };
+  if (st.model === 'downloading') return { engine: 'apple', note: 'The Whisper model is still downloading, so Apple Speech was used.' };
+  if (st.model === 'missing') return { engine: 'apple', note: 'The Whisper model is not downloaded (Settings › General), so Apple Speech was used.' };
+  if (st.server === 'error' && !whisper.loaded) {
+    void whisper.start().catch(() => {}); // try again for the next dictation
+    return { engine: 'apple', note: `Whisper could not start${st.error ? ` (${st.error})` : ''}, so Apple Speech was used.` };
+  }
+  // the one-time Core ML compile takes minutes: never make a dictation wait for it
+  if (whisper.preparing || (!whisper.loaded && !whisper.compiledBefore())) {
+    void whisper.start().catch(() => {});
+    return { engine: 'apple', note: 'Preparing speech model… Apple Speech is used until it is ready.' };
+  }
+  return { engine: 'whisper' };
+}
+
+/** show an engine fallback note at most once every 10 minutes */
+function showEngineNote(note: string | undefined) {
+  if (!note) return;
+  const last = lastEngineNote.get(note) ?? 0;
+  if (Date.now() - last < 10 * 60_000) return;
+  lastEngineNote.set(note, Date.now());
+  notice(note);
+}
+
+const whisperLanguage = () => (LANGUAGE_LOCALES[setting('language', 'English')] ?? 'en-US').slice(0, 2);
+
+/** Whisper recordings: transcribe the WAV the helper wrote (Apple Speech results pass through unchanged) */
+async function speechToText(fin: Final): Promise<Final> {
+  if (fin.engine !== 'whisper') return fin;
+  if (!fin.audio || !existsSync(fin.audio)) return { ...fin, text: '' };
+  if (!whisper.running && !SELFTEST_WAV) setPhase('processing', { kind: 'dictation', detail: whisper.preparing ? 'Preparing speech model…' : 'Loading speech model…' });
+  const { wav, seconds } = toWhisperWav(new Uint8Array(readFileSync(fin.audio)));
+  if (seconds < 0.3) return { ...fin, text: '' };
+  const t0 = Date.now();
+  const text = await whisper.transcribe(wav, { language: whisperLanguage(), prompt: glossaryPrompt(D().dictionary ?? []), timeoutMs: 60_000 + seconds * 3000 });
+  log('[whisper] transcribed', { audioSeconds: Math.round(seconds * 10) / 10, ms: Date.now() - t0, chars: text.length });
+  return { ...fin, text, via: 'whisper' };
+}
+
+/** the temporary WAV of a Whisper dictation with history audio off */
+function dropTemp(fin: Final): Final {
+  if (!fin.temp || !fin.audio) return fin;
+  rmSync(fin.audio, { force: true });
+  return { ...fin, audio: null };
+}
+
+/* ---- memory saver: unload the Whisper model after N idle minutes (a key-down reloads it, ≈1.6 s) */
+let unloadTimer: NodeJS.Timeout | undefined;
+function armUnload() {
+  clearTimeout(unloadTimer);
+  if (!whisper) return;
+  const min = UNLOAD_OPTIONS[setting('unloadModel', 'After 15 min')] ?? 15;
+  if (!min) return;
+  unloadTimer = setTimeout(() => {
+    if (!whisper.loaded) return;
+    // never kill the one-time compile, an active dictation or a pending Undo
+    if (whisper.preparing || phase !== 'idle' || cancelled) return armUnload();
+    log('[whisper] idle, unloading model', { min });
+    whisper.stop();
+  }, min * 60_000);
+}
+
+/** start/stop the model to match the engine setting */
+function applyEngine() {
+  if (setting('engine', 'whisper') === 'whisper' && whisper.usable) {
+    void whisper.start().catch(() => {});
+    armUnload();
+  } else {
+    clearTimeout(unloadTimer);
+    whisper.stop();
+  }
 }
 
 let permissionHint = false; // interim currently holds a permission hint, not speech
@@ -496,7 +661,8 @@ function finishRecording(): Promise<Final> {
     finalWaiter = (f) => {
       clearTimeout(t);
       finalWaiter = null;
-      resolve({ ...f, text: pickFinalText(f.text, heard()) });
+      const temp = !!f.audio && path.dirname(f.audio) === path.resolve(app.getPath('temp'));
+      resolve({ ...f, temp, text: f.engine === 'whisper' ? '' : pickFinalText(f.text, heard()) });
     };
     helper.send({ cmd: 'stop' });
   });
@@ -510,11 +676,22 @@ async function stopDictation() {
   mute(false);
   // read the clipboard (to restore it after pasting) while the helper finishes, not after
   const savedClip = saveClipboard();
-  const fin = await finishRecording();
+  let fin = await finishRecording();
+  session = null;
+  if (heldMs >= MIN_RECORDING_MS && fin.engine === 'whisper') {
+    try {
+      fin = await speechToText(fin);
+    } catch (e) {
+      log('[whisper] transcription failed', String(e));
+      discardAudio(fin.audio);
+      interim = '';
+      return failDictation(`Whisper could not transcribe this dictation: ${(e as Error).message ?? e}`);
+    }
+  }
+  fin = dropTemp(fin);
   timing.finalAt = Date.now();
   timing.stopToFinalMs = timing.finalAt - timing.keyUpAt;
   timing.finalVia = fin.via;
-  session = null;
   const raw = fin.text.trim();
   if (!raw || heldMs < MIN_RECORDING_MS) {
     // nothing said (or an accidental tap): drop it quietly, like Wispr does
@@ -527,6 +704,7 @@ async function stopDictation() {
   await deliver(raw, fin, pendingId, startedAt, frontApp, await savedClip, timing);
   interim = '';
   setPhase('idle');
+  showEngineNote(engineNote);
 }
 
 function discardAudio(file: string | null) {
@@ -537,6 +715,7 @@ function discardAudio(file: string | null) {
 async function deliver(raw: string, fin: Final, id: string, ts: number, app: { bundleId: string; name: string }, savedClip?: ClipboardItem[], t?: typeof timing) {
   const out = await processDictation(raw, app);
   const res = await pasteText(out.text, savedClip);
+  if (res.pasted) learnAfterPaste(out.text);
   if (t?.keyUpAt) {
     const now = Date.now();
     const { keyDownAt: _k, keyUpAt, finalAt, ...rest } = t;
@@ -557,6 +736,7 @@ async function deliver(raw: string, fin: Final, id: string, ts: number, app: { b
     dictFixes: out.dictFixes,
     audio: fin.audio ? path.basename(fin.audio) : undefined,
     engine: out.engine,
+    speech: fin.engine ?? 'apple',
   };
   mutate({ collection: 'history', op: 'add', item });
   broadcast('dictation:result', { item, ...res, note: out.note });
@@ -605,7 +785,15 @@ async function undoCancel() {
   cancelled = null;
   clearTimeout(c.timer);
   setPhase('processing', { kind: 'dictation' });
-  const fin = await c.raw;
+  let fin = await c.raw;
+  try {
+    // Whisper: the cancelled audio is transcribed only now that it is wanted
+    fin = dropTemp(await speechToText(fin));
+  } catch (e) {
+    log('[whisper] transcription failed', String(e));
+    discardAudio(fin.audio);
+    return failDictation(`Whisper could not transcribe this dictation: ${(e as Error).message ?? e}`);
+  }
   const raw = fin.text.trim();
   if (!raw) {
     discardAudio(fin.audio);
@@ -614,6 +802,106 @@ async function undoCancel() {
   }
   await deliver(raw, fin, c.id, c.ts, c.app);
   setPhase('idle');
+}
+
+/* ------------------------------------------------------------------ auto-learn from edits (RoyFlow learn.js)
+   After a paste, read the focused field (AXValue via the helper; secure fields are skipped). A few seconds later,
+   if the user fixed a word we got wrong, add the corrected spelling to the dictionary. */
+interface LearnWatch {
+  pid: number;
+  pasted: string;
+  before: string;
+  timers: NodeJS.Timeout[];
+}
+let learnWatch: LearnWatch | null = null;
+function clearLearn() {
+  learnWatch?.timers.forEach(clearTimeout);
+  learnWatch = null;
+}
+async function focusedField(): Promise<{ text: string | null; pid: number } | null> {
+  const r = await helper.request<{ type: 'focusedText'; text: string | null; pid: number }>({ cmd: 'focusedText' }, 'focusedText', 800);
+  return r ? { text: typeof r.text === 'string' ? r.text : null, pid: Number(r.pid) || 0 } : null;
+}
+function learnAfterPaste(pasted: string) {
+  clearLearn();
+  if (!setting('autoLearn', true)) return;
+  setTimeout(async () => {
+    const f = await focusedField();
+    // a field we cannot read, or the paste did not land in it
+    if (!f || f.text == null || !f.pid || !f.text.includes(pasted.trim().slice(0, 40))) return;
+    clearLearn();
+    const w: LearnWatch = { pid: f.pid, pasted, before: f.text, timers: [] };
+    w.timers = LEARN_CHECK_AFTER_MS.map((ms) => setTimeout(() => void learnCheck(w), ms));
+    learnWatch = w;
+  }, 300);
+}
+async function learnCheck(w: LearnWatch) {
+  if (learnWatch !== w) return;
+  const f = await focusedField();
+  if (learnWatch !== w || !f || f.pid !== w.pid || f.text == null) return; // only the same app's field
+  const known = new Set((D().dictionary ?? []).map((d) => d.word.toLowerCase()));
+  const add = correctionPairs(w.pasted, w.before, f.text).filter((c) => !known.has(c.word.toLowerCase()));
+  if (!add.length) return;
+  clearLearn();
+  const now = Date.now();
+  const words = add.map((c) => ({
+    id: uid(),
+    word: c.word,
+    // a case-only fix needs no misspelling: dictionary words already match any casing
+    misspelling: c.misspelling.toLowerCase() === c.word.toLowerCase() ? undefined : c.misspelling,
+    scope: 'personal' as const,
+    created: now,
+    auto: true,
+  }));
+  mainPatch({ dictionary: [...words, ...(D().dictionary ?? [])] });
+  log('[learn] added to dictionary', { count: words.length });
+  notice(`Added ${words.map((x) => `“${x.word}”`).join(', ')} to your dictionary`);
+}
+/** a new dictation is starting: last chance to see the edit */
+function learnBeforeDictation() {
+  const w = learnWatch;
+  if (!w) return;
+  void learnCheck(w).finally(() => learnWatch === w && clearLearn());
+}
+
+/* ------------------------------------------------------------------ Focus Mode (RoyFlow): hide listed apps while they are frontmost */
+const focusApps = () =>
+  setting('focusApps', '')
+    .split('\n')
+    .map((x) => x.trim())
+    .filter(Boolean);
+let lastFocusNotice = 0;
+function focusCheck(a: { name: string; pid: number }) {
+  if (!setting('focusMode', false) || !a.pid || !focusApps().includes(a.name)) return;
+  void helper.request<{ type: 'hidden'; ok: boolean }>({ cmd: 'hide', pid: a.pid }, 'hidden', 1000).then((r) => {
+    if (!r?.ok || Date.now() - lastFocusNotice < 4000) return;
+    lastFocusNotice = Date.now();
+    log('[focus] hid an app');
+    notice(`${a.name} is hidden in Focus Mode`);
+  });
+}
+function focusCheckFrontmost() {
+  if (!setting('focusMode', false)) return;
+  void helper.request<{ type: 'frontmost'; name: string; pid: number }>({ cmd: 'frontmost' }, 'frontmost', 800).then((f) => f && focusCheck({ name: f.name, pid: Number(f.pid) || 0 }));
+}
+
+/* ------------------------------------------------------------------ a new microphone was plugged in: offer to switch */
+function onDevicesChanged(list: string[], physical: string[]) {
+  const before = new Set(devices);
+  const known = devices.length > 0; // the startup list arrived (else everything would look new)
+  devices = list;
+  rebuildMenus();
+  if (!known || !setting('offerNewMic', true) || phase !== 'idle' || meeting) return;
+  const fresh = physical.find((d) => !before.has(d) && d !== setting('microphone', DEFAULT_MIC));
+  if (!fresh) return;
+  log('[mic] new input device');
+  pinBar(8000);
+  notice(`${fresh} connected`, undefined, { id: `switch-mic:${fresh}`, label: 'Switch' });
+}
+function switchMic(name: string) {
+  if (!devices.includes(name)) return;
+  mainPatch({ settings: { ...(D().settings ?? {}), microphone: name } });
+  notice(`Using ${name}`);
 }
 
 function toggleDictation() {
@@ -868,7 +1156,7 @@ const toggleMeeting = () => (meeting ? void stopMeeting() : void startMeeting().
 
 /* ------------------------------------------------------------------ helper messages */
 helper.on('message', (m: HelperMessage) => {
-  if (!['level', 'partial', 'keys', 'segment', 'access'].includes(m.type)) log('[helper]', m.type === 'final' ? { type: 'final', chars: String(m.text ?? '').length, via: m.via, stopMs: m.stopMs } : m);
+  if (!['level', 'partial', 'keys', 'segment', 'access', 'activated', 'focusedText', 'frontmost'].includes(m.type)) log('[helper]', m.type === 'final' ? { type: 'final', chars: String(m.text ?? '').length, via: m.via, stopMs: m.stopMs } : m);
   switch (m.type) {
     case 'partial':
       if (session === 'meeting' && meeting) {
@@ -919,7 +1207,13 @@ helper.on('message', (m: HelperMessage) => {
     }
     case 'final':
       if (m.mode === 'meeting') meetingFinal?.(true);
-      else finalWaiter?.({ text: String(m.text ?? ''), audio: typeof m.audio === 'string' ? m.audio : null, seconds: Number(m.seconds) || 0, via: typeof m.via === 'string' ? m.via : undefined });
+      else finalWaiter?.({ text: String(m.text ?? ''), audio: typeof m.audio === 'string' ? m.audio : null, seconds: Number(m.seconds) || 0, via: typeof m.via === 'string' ? m.via : undefined, engine: m.engine === 'whisper' ? 'whisper' : 'apple' });
+      break;
+    case 'activated':
+      focusCheck({ name: String(m.name ?? ''), pid: Number(m.pid) || 0 });
+      break;
+    case 'devices':
+      if (m.changed && Array.isArray(m.devices)) onDevicesChanged(m.devices.map(String), Array.isArray(m.physical) ? m.physical.map(String) : []);
       break;
     case 'hotkey':
       onHotkey(String(m.action), String(m.phase));
@@ -1384,6 +1678,9 @@ function onDataChanged(prev: Partial<State>, keys: string[]) {
     if (s.muteWhileDictating === false && muted) mute(false);
     if (s.microphone !== p.microphone || s.language !== p.language) warmMic();
     if (s.localStorage !== p.localStorage) applyRetention();
+    if (s.engine !== p.engine) applyEngine();
+    if (s.unloadModel !== p.unloadModel) armUnload();
+    if (s.focusMode !== p.focusMode || s.focusApps !== p.focusApps) focusCheckFrontmost();
   }
   if (keys.includes('hotkeys') || keys.includes('transforms')) {
     sendHotkeys();
@@ -1458,6 +1755,7 @@ function wireIpc() {
   });
   ipcMain.on('flowbar:action', (_e, id: string) => {
     if (id === 'undo-cancel') void undoCancel();
+    else if (typeof id === 'string' && id.startsWith('switch-mic:')) switchMic(id.slice(11));
   });
   ipcMain.on('flowbar:ready', () => {
     pushBarConfig();
@@ -1570,6 +1868,22 @@ function wireIpc() {
   ipcMain.handle('calendar:get', (_e, { request }: { request: boolean }) => refreshCalendar(request));
   ipcMain.handle('mcp:info', () => mcpInfo());
   ipcMain.handle('mcp:addClaude', () => addToClaude(hub));
+  ipcMain.handle('whisper:status', () => whisper.status());
+  ipcMain.handle('whisper:download', async () => {
+    try {
+      await whisper.downloadModel();
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: (e as Error).message };
+    }
+  });
+  ipcMain.handle('apps:installed', () => {
+    const names = new Set<string>();
+    for (const d of ['/Applications', '/System/Applications', path.join(app.getPath('home'), 'Applications')])
+      for (const f of readdirSafe(d)) if (f.endsWith('.app')) names.add(f.slice(0, -4));
+    names.delete('Roy Flow');
+    return [...names].sort((a, b) => a.localeCompare(b));
+  });
   ipcMain.handle('notify:test', () => notify('Notifications are on', 'Roy Flow will let you know about milestones and meetings.', 'milestone'));
 }
 
@@ -1622,14 +1936,49 @@ app.on('will-quit', () => {
   if (muted) helper.send({ cmd: 'mute', on: false });
   saveNow();
   stopMcpServer();
+  whisper?.stop();
   helper.kill();
 });
 app.on('window-all-closed', () => {
   /* stay alive in the menu bar */
 });
 
+/* ------------------------------------------------------------------ Whisper self-test (test-only, see SELFTEST_WAV) */
+async function runWhisperSelfTest(file: string) {
+  const out = process.env.ROYFLOW_SELFTEST_OUT || path.join(app.getPath('logs'), 'whisper-selftest.json');
+  const result: Record<string, unknown> = { file, at: new Date().toISOString(), bin: WHISPER_BIN };
+  let code = 1;
+  try {
+    initWhisper();
+    result.status = whisper.status();
+    result.compiledBefore = whisper.compiledBefore();
+    log('[selftest] whisper', result.status, { compiledBefore: result.compiledBefore });
+    const t0 = Date.now();
+    await whisper.start();
+    result.startMs = Date.now() - t0;
+    const t1 = Date.now();
+    // the same path a dictation takes: helper WAV -> 16 kHz mono -> whisper-server -> dictionary + rule clean-up
+    const fin = await speechToText({ text: '', audio: file, seconds: 0, engine: 'whisper' });
+    result.transcribeMs = Date.now() - t1;
+    result.transcript = fin.text;
+    const dict = (D().dictionary ?? []).map((w) => ({ word: w.word, misspelling: w.misspelling }));
+    result.cleaned = cleanUp(applyDictionary(fin.text, dict).text, 'Medium');
+    log('[selftest] transcript:', fin.text);
+    code = fin.text.trim() ? 0 : 2;
+  } catch (e) {
+    result.error = String(e);
+    log('[selftest] failed', String(e));
+  } finally {
+    whisper?.stop();
+    writeFileSync(out, JSON.stringify(result, null, 2));
+    console.log(JSON.stringify(result));
+    app.exit(code);
+  }
+}
+
 app.whenReady().then(async () => {
   loadData();
+  if (SELFTEST_WAV) return void runWhisperSelfTest(SELFTEST_WAV);
   if (!hasData()) {
     // first run: main creates the data file, so it never depends on a hub window being open
     const s = emptyState();
@@ -1649,6 +1998,7 @@ app.whenReady().then(async () => {
   log('[app] ready', { version: app.getVersion(), packaged: app.isPackaged, helper: helper.available, data: hasData() });
   if (process.argv.includes('--latency-test')) return void runLatencyTest();
   if (!isDev) serveDist();
+  initWhisper();
   wireIpc();
   createTray();
   createBar();
@@ -1666,6 +2016,8 @@ app.whenReady().then(async () => {
   startupAnnouncements();
   scheduleAccessPoll();
   warmMic();
+  applyEngine();
+  focusCheckFrontmost();
   applyRetention();
   setInterval(applyRetention, 6 * 3600_000);
   setInterval(() => {

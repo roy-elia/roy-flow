@@ -29,6 +29,8 @@ export interface HistoryItem {
   audio?: string;
   /** cleanup engine used */
   engine?: 'claude' | 'rules';
+  /** speech-to-text engine that produced the transcript */
+  speech?: 'whisper' | 'apple';
 }
 export interface DictWord {
   id: string;

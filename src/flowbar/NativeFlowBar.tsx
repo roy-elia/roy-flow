@@ -36,6 +36,8 @@ export default function NativeFlowBar() {
   const [changes, setChanges] = useState<TransformChange | null>(null);
   const noteTimer = useRef(0);
   const [mic, setMic] = useState<string | null>(null);
+  const [detail, setDetail] = useState('');
+  const lastPhase = useRef<DictationPhase>('idle');
   const micTimer = useRef(0);
 
   const notify = (n: Note, ms = 4000) => {
@@ -57,10 +59,13 @@ export default function NativeFlowBar() {
         setPhase(s.phase);
         setInterim(s.interim ?? '');
         setKindLabel(s.kind === 'transform' ? (s.label ?? 'Transform') : '');
-        if (s.phase === 'recording') {
+        setDetail(s.phase === 'processing' ? (s.detail ?? '') : '');
+        // only when a recording begins (status repeats with every live partial; notes such as "1 minute left" stay)
+        if (s.phase === 'recording' && lastPhase.current !== 'recording') {
           setNote(null);
           setChanges(null);
         }
+        lastPhase.current = s.phase;
         if (s.phase !== 'recording') {
           setLevels(Array(BARS).fill(0.15));
           setMic(null);
@@ -122,7 +127,7 @@ export default function NativeFlowBar() {
 
   // grow the panel window only while there is more than the pill to draw
   // (the short mic label fits the small bottom panel; side docks need the wider one)
-  const expanded = !!(changes || note || tip || (phase === 'recording' && (interim || cfg.creatorMode || (mic && cfg.dock !== 'bottom'))) || (phase === 'processing' && kindLabel));
+  const expanded = !!(changes || note || tip || (phase === 'recording' && (interim || cfg.creatorMode || (mic && cfg.dock !== 'bottom'))) || (phase === 'processing' && (kindLabel || detail)));
   useEffect(() => {
     native?.send('flowbar:expand', expanded);
   }, [expanded]);
@@ -179,6 +184,7 @@ export default function NativeFlowBar() {
       {phase === 'recording' && interim && <div className="fb-live">{interim}</div>}
       {phase === 'recording' && cfg.creatorMode && !interim && <div className="fb-tip">Dictating with Roy Flow</div>}
       {phase === 'processing' && kindLabel && <div className="fb-tip">Running {kindLabel}…</div>}
+      {phase === 'processing' && !kindLabel && detail && <div className="fb-tip">{detail}</div>}
       {tip && (look === 'ready' || look === 'recording') && <div className="fb-tip">{tip}</div>}
       <div
         className="fb-hot"

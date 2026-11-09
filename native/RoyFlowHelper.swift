@@ -1,7 +1,10 @@
 // RoyFlowHelper: the small native helper the Roy Flow main process spawns.
 // Speaks line-delimited JSON on stdin/stdout.
 //
-// in : {"cmd":"start","locale":"en-US","device":"<input name>","mode":"dictation"|"meeting","record":"/path.wav"}
+// in : {"cmd":"start","locale":"en-US","device":"<input name>","mode":"dictation"|"meeting","record":"/path.wav","engine":"apple"|"whisper"}
+//        engine "whisper": record the mic to `record` only (no SFSpeechRecognizer); main transcribes the WAV
+//      {"cmd":"focusedText"}                                   AXValue of the focused text element (not secure fields)
+//      {"cmd":"hide","pid":123}                                hide a running app (Focus Mode)
 //      {"cmd":"stop"} | {"cmd":"cancel"}
 //      {"cmd":"paste"} | {"cmd":"copy"}                       synthetic ⌘V / ⌘C into the frontmost app
 //      {"cmd":"access","prompt":false,"listen":false}          Accessibility / Input Monitoring status
@@ -24,6 +27,9 @@
 //      {"type":"keys","down":["opt","space"]} {"type":"tap","state":"active"|"listen"|"off"}
 //      {"type":"calendar","status":"authorized"|"denied"|"notDetermined"|"restricted","events":[...]}
 //      {"type":"authorizing","service":"microphone"|"speech"} {"type":"error","code":"...","message":"..."}
+//      {"type":"focusedText","text":"..."|null,"pid":123} {"type":"hidden","pid":123,"ok":true}
+//      {"type":"activated","bundleId":"...","name":"...","pid":123}   an app came to the front
+//      {"type":"devices","devices":[...],"physical":[...],"changed":true}  input devices were added/removed
 import AVFoundation
 import AppKit
 import ApplicationServices
@@ -78,6 +84,15 @@ func inputDevices() -> [(id: AudioDeviceID, name: String)] {
         out.append((id, n as String))
     }
     return out
+}
+
+/// a real microphone (built-in, USB, Bluetooth...), not a virtual or aggregate device apps install (Zoom, Teams, Loopback)
+func isPhysicalDevice(_ id: AudioDeviceID) -> Bool {
+    var addr = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyTransportType, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+    var t: UInt32 = 0
+    var size = UInt32(MemoryLayout<UInt32>.size)
+    guard AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &t) == noErr else { return false }
+    return ![kAudioDeviceTransportTypeVirtual, kAudioDeviceTransportTypeAggregate, kAudioDeviceTransportTypeAutoAggregate, kAudioDeviceTransportTypeUnknown].contains(t)
 }
 
 // MARK: - System output mute (saved and restored around dictation)
@@ -192,11 +207,14 @@ final class Dictation {
     private var audioEndedAt = Date()
     private var gotFinal = false
     private var lastWarmArgs: (locale: String, device: String?)?
+    /// "whisper": record only, no recognizer (main transcribes the WAV with whisper-server)
+    private var recordOnly = false
 
     var busy: Bool { !finished }
 
-    func start(locale: String, device: String?, mode: String, record: String?) {
+    func start(locale: String, device: String?, mode: String, record: String?, engine: String = "apple") {
         guard finished else { return emitError("busy", mode == "meeting" ? "Something is already recording" : "A recording is already running") }
+        recordOnly = engine == "whisper" && mode != "meeting" && !(record ?? "").isEmpty
         finished = false
         stopping = false
         startRequested = Date()
@@ -205,15 +223,16 @@ final class Dictation {
         self.mode = mode
         session += 1
         let id = session
-        authorize { [weak self] ok in
+        authorize(speech: !recordOnly) { [weak self] ok in
             guard let self, id == self.session, !self.finished else { return }
             guard ok else { self.finished = true; return }
             self.begin(locale: locale, device: device, record: record, session: id)
         }
     }
 
-    private func authorize(_ done: @escaping (Bool) -> Void) {
+    private func authorize(speech needSpeech: Bool, _ done: @escaping (Bool) -> Void) {
         let speech = { (next: @escaping () -> Void) in
+            if !needSpeech { return next() }
             switch SFSpeechRecognizer.authorizationStatus() {
             case .authorized: next()
             case .notDetermined:
@@ -301,13 +320,19 @@ final class Dictation {
     }
 
     private func begin(locale: String, device: String?, record: String?, session id: Int) {
-        guard let recognizer = recognizerFor(locale), recognizer.isAvailable else {
-            finished = true
-            return emitError("unavailable", "Speech recognition is not available for \(locale)")
+        var recognizer: SFSpeechRecognizer? = nil
+        var onDevice = true
+        var req: SFSpeechAudioBufferRecognitionRequest? = nil
+        if !recordOnly {
+            guard let r = recognizerFor(locale), r.isAvailable else {
+                finished = true
+                return emitError("unavailable", "Speech recognition is not available for \(locale)")
+            }
+            recognizer = r
+            onDevice = r.supportsOnDeviceRecognition
+            req = makeRequest(onDevice: onDevice)
         }
         self.recognizer = recognizer
-        let onDevice = recognizer.supportsOnDeviceRecognition
-        let req = makeRequest(onDevice: onDevice)
 
         let (engine, usedDevice) = engineFor(device ?? "")
         let input = engine.inputNode
@@ -331,6 +356,9 @@ final class Dictation {
             if let f = try? AVAudioFile(forWriting: URL(fileURLWithPath: record), settings: settings, commonFormat: .pcmFormatFloat32, interleaved: false) {
                 file = f
                 filePath = record
+            } else if recordOnly {
+                finished = true
+                return emitError("audio", "Could not create the recording file")
             }
         }
         input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
@@ -350,12 +378,14 @@ final class Dictation {
         self.engine = engine
         self.request = req
         startedAt = Date()
-        if mode == "meeting" {
+        if recordOnly {
+            task = nil
+        } else if mode == "meeting", let recognizer, let req {
             segmentStart = 0
             segmentText = ""
             startSegmentTask(recognizer: recognizer, request: req, session: id)
             rotateTimer = Timer.scheduledTimer(withTimeInterval: 45, repeats: true) { [weak self] _ in self?.rotate(onDevice: onDevice) }
-        } else {
+        } else if let recognizer, let req {
             task = recognizer.recognitionTask(with: req) { [weak self] result, error in
                 DispatchQueue.main.async {
                     guard let self, id == self.session, !self.finished else { return }
@@ -378,7 +408,7 @@ final class Dictation {
             }
         }
         let deviceName = usedDevice == "default" ? (defaultInputName() ?? "") : usedDevice
-        emit(["type": "started", "onDevice": onDevice, "device": usedDevice, "deviceName": deviceName, "mode": mode, "ms": Int(Date().timeIntervalSince(startRequested) * 1000)])
+        emit(["type": "started", "onDevice": onDevice, "device": usedDevice, "deviceName": deviceName, "mode": mode, "engine": recordOnly ? "whisper" : "apple", "ms": Int(Date().timeIntervalSince(startRequested) * 1000)])
     }
 
     // meeting mode: each recognition task covers ~45 s; finished tasks are reported as segments
@@ -484,7 +514,7 @@ final class Dictation {
         request = nil
         pendingSegments = 0
         let stopMs = stopping ? Int(Date().timeIntervalSince(stopRequested) * 1000) : 0
-        emit(["type": "final", "text": lastText, "audio": filePath ?? NSNull(), "seconds": (Date().timeIntervalSince(startedAt) * 10).rounded() / 10, "mode": mode, "via": via.rawValue, "stopMs": stopMs])
+        emit(["type": "final", "text": lastText, "audio": filePath ?? NSNull(), "seconds": (Date().timeIntervalSince(startedAt) * 10).rounded() / 10, "mode": mode, "via": via.rawValue, "stopMs": stopMs, "engine": recordOnly ? "whisper" : "apple"])
     }
 
     func cancel() {
@@ -1101,17 +1131,68 @@ func calendar(request: Bool, days: Int) {
 
 func frontmost() -> [String: Any] {
     if let app = NSWorkspace.shared.frontmostApplication {
-        return ["type": "frontmost", "bundleId": app.bundleIdentifier ?? "", "name": app.localizedName ?? ""]
+        return ["type": "frontmost", "bundleId": app.bundleIdentifier ?? "", "name": app.localizedName ?? "", "pid": Int(app.processIdentifier)]
     }
     // fallback: owner of the frontmost normal window
     if let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] {
         for w in list where (w[kCGWindowLayer as String] as? Int) == 0 {
             if let pid = w[kCGWindowOwnerPID as String] as? pid_t, let app = NSRunningApplication(processIdentifier: pid) {
-                return ["type": "frontmost", "bundleId": app.bundleIdentifier ?? "", "name": app.localizedName ?? ""]
+                return ["type": "frontmost", "bundleId": app.bundleIdentifier ?? "", "name": app.localizedName ?? "", "pid": Int(pid)]
             }
         }
     }
     return ["type": "frontmost", "bundleId": "", "name": ""]
+}
+
+// MARK: - Focused text (auto-learn) and hiding apps (Focus Mode)
+
+/// AXValue of the focused text element, or nil (secure/password fields, non-text elements, very long values)
+func focusedText() -> [String: Any] {
+    var out: [String: Any] = ["type": "focusedText", "text": NSNull(), "pid": 0]
+    let sys = AXUIElementCreateSystemWide()
+    AXUIElementSetMessagingTimeout(sys, 0.25)
+    var focused: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(sys, kAXFocusedUIElementAttribute as CFString, &focused) == .success, let f = focused, CFGetTypeID(f) == AXUIElementGetTypeID() else { return out }
+    let el = f as! AXUIElement
+    var pid: pid_t = 0
+    AXUIElementGetPid(el, &pid)
+    out["pid"] = Int(pid)
+    var sub: CFTypeRef?
+    AXUIElementCopyAttributeValue(el, kAXSubroleAttribute as CFString, &sub)
+    if let s = sub as? String, s == (kAXSecureTextFieldSubrole as String) { return out }
+    var role: CFTypeRef?
+    AXUIElementCopyAttributeValue(el, kAXRoleAttribute as CFString, &role)
+    if let r = role as? String, r == "AXSecureTextField" { return out }
+    var value: CFTypeRef?
+    if AXUIElementCopyAttributeValue(el, kAXValueAttribute as CFString, &value) == .success, let v = value as? String, v.utf16.count < 200_000 {
+        out["text"] = v
+    }
+    return out
+}
+
+func hideApp(pid: pid_t) -> Bool {
+    guard pid > 0, pid != getpid(), let app = NSRunningApplication(processIdentifier: pid) else { return false }
+    return app.hide()
+}
+
+/// report app activations (Focus Mode) and input device changes (offer to switch to a new mic)
+func observeSystem() {
+    NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { n in
+        guard let app = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+        emit(["type": "activated", "bundleId": app.bundleIdentifier ?? "", "name": app.localizedName ?? "", "pid": Int(app.processIdentifier)])
+    }
+    var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDevices, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+    var pending = false
+    AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &addr, DispatchQueue.main) { _, _ in
+        // devices often arrive in bursts (input + output of one headset): report once
+        if pending { return }
+        pending = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+            pending = false
+            let list = inputDevices()
+            emit(["type": "devices", "devices": list.map { $0.name }, "physical": list.filter { isPhysicalDevice($0.id) }.map { $0.name }, "changed": true])
+        }
+    }
 }
 
 // MARK: - Sounds
@@ -1135,7 +1216,7 @@ func handle(_ line: String) {
     }
     switch cmd {
     case "start":
-        dictation.start(locale: obj["locale"] as? String ?? "en-US", device: obj["device"] as? String, mode: obj["mode"] as? String ?? "dictation", record: obj["record"] as? String)
+        dictation.start(locale: obj["locale"] as? String ?? "en-US", device: obj["device"] as? String, mode: obj["mode"] as? String ?? "dictation", record: obj["record"] as? String, engine: obj["engine"] as? String ?? "apple")
     case "warm": dictation.prewarm(locale: obj["locale"] as? String ?? "en-US", device: obj["device"] as? String)
     case "stop": dictation.stop()
     case "cancel": dictation.cancel()
@@ -1148,6 +1229,10 @@ func handle(_ line: String) {
         emit(["type": "access", "trusted": trusted, "listen": CGPreflightListenEventAccess(), "tap": hotkeys.state])
     case "devices": emit(["type": "devices", "devices": inputDevices().map { $0.name }])
     case "frontmost": emit(frontmost())
+    case "focusedText": emit(focusedText())
+    case "hide":
+        let pid = pid_t(obj["pid"] as? Int ?? 0)
+        emit(["type": "hidden", "pid": Int(pid), "ok": hideApp(pid: pid)])
     case "hotkeys": hotkeys.setBindings(obj["bindings"] as? [[String: Any]] ?? [])
     case "context": hotkeys.context = Set(obj["flags"] as? [String] ?? [])
     case "record": hotkeys.setRecording(obj["on"] as? Bool ?? false)
@@ -1188,5 +1273,6 @@ Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { _ in
     if !hotkeys.bindings.isEmpty { hotkeys.ensureTap() }
 }
 
-emit(["type": "ready", "version": 2])
+observeSystem()
+emit(["type": "ready", "version": 3])
 CFRunLoopRun()
