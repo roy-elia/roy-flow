@@ -3,6 +3,7 @@
 //
 // in : {"cmd":"start","locale":"en-US","device":"<input name>","mode":"dictation"|"meeting","record":"/path.wav","engine":"apple"|"whisper"}
 //        engine "whisper": record the mic to `record` only (no SFSpeechRecognizer); main transcribes the WAV
+//        meeting + engine "whisper" + "chunks":"/dir": the mic is cut into short WAVs at pauses (see Chunker)
 //      {"cmd":"focusedText"}                                   AXValue of the focused text element (not secure fields)
 //      {"cmd":"hide","pid":123}                                hide a running app (Focus Mode)
 //      {"cmd":"stop"} | {"cmd":"cancel"}
@@ -19,6 +20,7 @@
 // out: {"type":"ready"} {"type":"started","onDevice":true} {"type":"partial","text":"..."}
 //      {"type":"final","text":"...","audio":"/path.wav"|null,"seconds":3.2}
 //      {"type":"segment","text":"...","start":12.5}            meeting mode: a finished stretch of speech
+//      {"type":"chunk","path":"/dir/0003.wav","start":41.2,"seconds":9.8}  meeting + Whisper: a closed chunk
 //      {"type":"level","value":0.42} {"type":"cancelled"}
 //      {"type":"pasted","ok":true} {"type":"copied","ok":true}
 //      {"type":"access","trusted":true,"listen":true,"tap":"active"|"listen"|"off"}
@@ -181,6 +183,70 @@ func defaultInputName() -> String? {
     return inputDevices().first(where: { $0.id == dev })?.name
 }
 
+// MARK: - Meeting chunks for Whisper
+
+/// Meeting + Whisper: writes the mic into short WAV files and closes each one at a pause (or after 20 s), so
+/// main can transcribe the meeting while it is still going. Chunks with no speech are deleted, not reported.
+/// write() runs on the audio thread; onChunk is called on the main queue.
+final class Chunker {
+    static let minSeconds = 4.0, maxSeconds = 20.0, pauseSeconds = 0.6, minSpeech = 0.25
+    static let speechRms: Float = 0.012 // about -38 dBFS
+    private let dir: String
+    private let settings: [String: Any]
+    private let format: AVAudioFormat
+    private let onChunk: (String, Double, Double) -> Void
+    private var file: AVAudioFile?
+    private var path = ""
+    private var index = 0
+    private var total = 0.0 // frames written since the start
+    private var frames = 0.0, speech = 0.0, silence = 0.0 // in the open chunk
+
+    init(dir: String, settings: [String: Any], format: AVAudioFormat, onChunk: @escaping (String, Double, Double) -> Void) {
+        self.dir = dir
+        self.settings = settings
+        self.format = format
+        self.onChunk = onChunk
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    }
+
+    func write(_ buffer: AVAudioPCMBuffer) {
+        let n = Double(buffer.frameLength)
+        guard n > 0 else { return }
+        if file == nil {
+            index += 1
+            path = (dir as NSString).appendingPathComponent(String(format: "%05d.wav", index))
+            file = try? AVAudioFile(forWriting: URL(fileURLWithPath: path), settings: settings, commonFormat: .pcmFormatFloat32, interleaved: false)
+        }
+        try? file?.write(from: buffer)
+        var rms: Float = 0
+        if let d = buffer.floatChannelData?[0] {
+            var sum: Float = 0
+            for i in 0..<Int(buffer.frameLength) { sum += d[i] * d[i] }
+            rms = sqrt(sum / Float(n))
+        }
+        frames += n
+        total += n
+        if rms >= Chunker.speechRms { speech += n; silence = 0 } else { silence += n }
+        let rate = format.sampleRate
+        if (frames / rate >= Chunker.minSeconds && silence / rate >= Chunker.pauseSeconds) || frames / rate >= Chunker.maxSeconds { close() }
+    }
+
+    /// close the open chunk (also called at stop, after the tap is removed)
+    func close() {
+        guard file != nil else { return }
+        file = nil // finalises the WAV header
+        let rate = format.sampleRate
+        let p = path, seconds = frames / rate, start = (total - frames) / rate, spoken = speech / rate
+        frames = 0; speech = 0; silence = 0
+        if spoken < Chunker.minSpeech {
+            try? FileManager.default.removeItem(atPath: p)
+            return
+        }
+        let cb = onChunk
+        DispatchQueue.main.async { cb(p, (start * 10).rounded() / 10, (seconds * 10).rounded() / 10) }
+    }
+}
+
 // MARK: - Speech session (dictation, or a long meeting transcribed in segments)
 
 final class Dictation {
@@ -202,6 +268,8 @@ final class Dictation {
     private var segmentText = ""
     private var rotateTimer: Timer?
     private var pendingSegments = 0
+    private var chunker: Chunker?
+    private var chunkDir: String?
     // fast stop (dictation mode)
     private var stopRequested = Date()
     private var audioEndedAt = Date()
@@ -212,9 +280,10 @@ final class Dictation {
 
     var busy: Bool { !finished }
 
-    func start(locale: String, device: String?, mode: String, record: String?, engine: String = "apple") {
+    func start(locale: String, device: String?, mode: String, record: String?, engine: String = "apple", chunks: String? = nil) {
         guard finished else { return emitError("busy", mode == "meeting" ? "Something is already recording" : "A recording is already running") }
-        recordOnly = engine == "whisper" && mode != "meeting" && !(record ?? "").isEmpty
+        chunkDir = mode == "meeting" && engine == "whisper" && !(chunks ?? "").isEmpty ? chunks : nil
+        recordOnly = engine == "whisper" && (mode == "meeting" ? chunkDir != nil : !(record ?? "").isEmpty)
         finished = false
         stopping = false
         startRequested = Date()
@@ -361,10 +430,27 @@ final class Dictation {
                 return emitError("audio", "Could not create the recording file")
             }
         }
+        chunker = nil
+        if let dir = chunkDir {
+            let settings: [String: Any] = [
+                AVFormatIDKey: kAudioFormatLinearPCM,
+                AVSampleRateKey: format.sampleRate,
+                AVNumberOfChannelsKey: format.channelCount,
+                AVLinearPCMBitDepthKey: 16,
+                AVLinearPCMIsFloatKey: false,
+                AVLinearPCMIsBigEndianKey: false,
+            ]
+            chunker = Chunker(dir: dir, settings: settings, format: format) { [weak self] path, start, seconds in
+                guard let self, id == self.session else { return }
+                emit(["type": "chunk", "path": path, "start": start, "seconds": seconds])
+            }
+        }
+        let chunker = self.chunker
         input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
             guard let self else { return }
             self.request?.append(buffer)
             if let f = self.file { try? f.write(from: buffer) }
+            chunker?.write(buffer)
             self.level(buffer)
         }
         engine.prepare()
@@ -470,6 +556,8 @@ final class Dictation {
         }
         engine = nil
         file = nil // closes and finalises the WAV header
+        chunker?.close() // the tap is gone: report the last chunk
+        chunker = nil
     }
 
     func stop() {
@@ -480,7 +568,8 @@ final class Dictation {
         if mode == "meeting" {
             stopAudio()
             request?.endAudio()
-            if task == nil { return finish(via: .noTask) }
+            // queued so it is sent after the last "chunk" (those are posted to the main queue too)
+            if task == nil { DispatchQueue.main.async { [weak self] in self?.finish(via: .noTask) }; return }
             DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self] in
                 guard let self, id == self.session else { return }
                 self.finish(via: .timeout)
@@ -521,6 +610,7 @@ final class Dictation {
         guard !finished else { return emit(["type": "cancelled"]) }
         finished = true
         session += 1
+        chunker = nil
         stopAudio()
         task?.cancel()
         task = nil
@@ -1216,7 +1306,7 @@ func handle(_ line: String) {
     }
     switch cmd {
     case "start":
-        dictation.start(locale: obj["locale"] as? String ?? "en-US", device: obj["device"] as? String, mode: obj["mode"] as? String ?? "dictation", record: obj["record"] as? String, engine: obj["engine"] as? String ?? "apple")
+        dictation.start(locale: obj["locale"] as? String ?? "en-US", device: obj["device"] as? String, mode: obj["mode"] as? String ?? "dictation", record: obj["record"] as? String, engine: obj["engine"] as? String ?? "apple", chunks: obj["chunks"] as? String)
     case "warm": dictation.prewarm(locale: obj["locale"] as? String ?? "en-US", device: obj["device"] as? String)
     case "stop": dictation.stop()
     case "cancel": dictation.cancel()

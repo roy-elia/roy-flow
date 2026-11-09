@@ -3,7 +3,7 @@ import http from 'node:http';
 import { mkdirSync, mkdtempSync, existsSync, writeFileSync, readdirSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { cleanTranscript, COREML_NAME, migrateModels, postInference, WhisperServer } from '../electron/whisper';
+import { cleanTranscript, COREML_NAME, migrateModels, postInference, postInferenceDetailed, WhisperServer } from '../electron/whisper';
 import { encodeWav } from '../electron/wav';
 
 /** a mock whisper-server: records each /inference multipart request and answers with a canned transcript */
@@ -109,5 +109,20 @@ describe('model migration from RoyFlow', () => {
     const root = mkdtempSync(path.join(os.tmpdir(), 'royflow-models-'));
     expect(migrateModels(path.join(root, 'a'), path.join(root, 'b'))).toEqual([]);
     expect(existsSync(path.join(root, 'b'))).toBe(false);
+  });
+});
+
+describe('whisper detailed inference (Notetaker)', () => {
+  it('asks for verbose_json and returns the detected language', async () => {
+    seen.length = 0;
+    reply = { status: 200, body: { task: 'transcribe', language: 'french', text: ' Bonjour à tous. ', segments: [] } };
+    const r = await postInferenceDetailed(base, wav, { language: 'auto' });
+    expect(r).toEqual({ text: 'Bonjour à tous.', language: 'french' });
+    expect(seen[0].body).toMatch(/name="response_format"\r\n\r\nverbose_json\r\n/);
+    expect(seen[0].body).toMatch(/name="language"\r\n\r\nauto\r\n/);
+  });
+  it('still filters silence and tolerates a missing language', async () => {
+    reply = { status: 200, body: { text: '[BLANK_AUDIO]' } };
+    expect(await postInferenceDetailed(base, wav)).toEqual({ text: '', language: undefined });
   });
 });

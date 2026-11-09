@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowLeft, ArrowUp, ArrowUpRight, CalendarDays, ChevronDown, ChevronUp, FileText, Folder, MessageSquare, Plus, RotateCw, Search, Settings, Trash2, X } from 'lucide-react';
+import { ArrowUp, ArrowUpRight, CalendarDays, FileText, Folder, MessageSquare, Plus, RotateCw, Search, Settings, Trash2, X } from 'lucide-react';
 import { setSetting, setState, toast, uid, useStore, type Chat, type ChatMessage, type Meeting } from '../store';
 import { openSettings, setNav, useNav } from '../nav';
 import { Confirm, Tabs } from '../components/ui';
@@ -8,6 +8,7 @@ import { native } from '../native/bridge';
 import { useCalendar } from '../native/useCalendar';
 import { useShortcutLabel } from '../settings/ShortcutsEditor';
 import type { MeetingStatus } from '../shared/ipc';
+import { MeetingDetail } from './MeetingNote';
 
 const dayKey = (ts: number) => new Date(ts).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
 const time = (ts: number) => new Date(ts).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }).toLowerCase();
@@ -182,7 +183,25 @@ export default function Notetaker() {
   };
 
   const openMeeting = meetings.find((m) => m.id === open);
-  if (openMeeting) return <MeetingDetail m={openMeeting} onBack={() => setOpen(null)} list={list} setOpen={setOpen} />;
+  if (openMeeting)
+    return (
+      <>
+        <MeetingDetail m={openMeeting} onBack={() => setOpen(null)} list={list} setOpen={setOpen} onDelete={() => setDel(openMeeting.id)} recording={status.recording} />
+        {del && (
+          <Confirm
+            title="Delete this meeting note?"
+            subtitle="The summary and transcript will be removed from this device."
+            onClose={() => setDel(null)}
+            onConfirm={() => {
+              setState((s) => ({ meetings: s.meetings.filter((m) => m.id !== del) }));
+              setOpen(null);
+              setDel(null);
+              toast('Meeting deleted');
+            }}
+          />
+        )}
+      </>
+    );
 
   const elapsed = status.recording ? Math.floor((Date.now() - status.startedAt) / 1000) : 0;
 
@@ -204,23 +223,18 @@ export default function Notetaker() {
         <div className="nt-scroll">
           <div className="nt-content">
             {status.recording && (
-              <section className="today-card nt-live">
-                <span className="caps">
-                  <span className="rec-dot" /> Recording · {status.title}
-                </span>
-                {settings.liveTranscript !== false ? (
-                  <div className="nt-live-body" ref={liveRef}>
-                    {status.segments.map((s, i) => (
-                      <p key={i}>
-                        <span className="muted small">{clock(s.t)}</span> {s.text}
-                      </p>
-                    ))}
-                    {status.partial && <p className="muted">{status.partial}</p>}
-                    {!status.segments.length && !status.partial && <p className="muted">Listening… words appear here as people speak.</p>}
-                  </div>
-                ) : (
-                  <p className="muted">Live transcript is hidden. Turn it on in Notetaker settings.</p>
-                )}
+              <section className="today-card nt-live-min">
+                <span className="rec-dot" />
+                <div className="nt-row-text">
+                  <span className="nt-row-title">{status.title || 'New note'}</span>
+                  <span className="nt-row-meta">
+                    Recording · {clock(elapsed)}
+                    {status.engine === 'whisper' ? ` · ${status.segments.length} lines so far` : ''}
+                  </span>
+                </div>
+                <button className="btn btn-outline btn-sm" onClick={() => native?.invoke('meeting:live', { show: true })}>
+                  Show live note
+                </button>
               </section>
             )}
             {!settings.notetakerAutoPromptDismissed && !settings.autoStartNotetaker && calConnected && (
@@ -357,7 +371,17 @@ export default function Notetaker() {
                             {m.title} {m.demo && <span className="badge">Demo</span>}
                           </span>
                           <span className="nt-row-meta">
-                            {time(m.ts)} · {m.minutes} min{m.summaryStatus === 'pending' ? ' · summarising…' : ''}
+                            {time(m.ts)} · {m.minutes} min
+                            {m.summaryStatus === 'pending' ? (
+                              ' · writing notes…'
+                            ) : !m.overview && !m.sections?.length && !!m.transcript?.length ? (
+                              <>
+                                {' · '}
+                                <button className="link" onClick={(e) => (e.stopPropagation(), setOpen(m.id), native?.invoke('meeting:summarize', { id: m.id }))}>
+                                  Generate summary
+                                </button>
+                              </>
+                            ) : null}
                           </span>
                         </div>
                         <div className="row-actions" style={{ padding: 0 }}>
@@ -492,116 +516,6 @@ export default function Notetaker() {
           }}
         />
       )}
-    </main>
-  );
-}
-
-function MeetingDetail({ m, onBack, list, setOpen }: { m: Meeting; onBack: () => void; list: Meeting[]; setOpen: (id: string) => void }) {
-  const [tab, setTab] = useState<'thoughts' | 'summary' | 'transcript'>('summary');
-  const [thoughts, setThoughts] = useState(m.thoughts ?? '');
-  const [folder, setFolder] = useState(m.folder ?? '');
-  const i = list.findIndex((x) => x.id === m.id);
-  const patch = (p: Partial<Meeting>) => setState((s) => ({ meetings: s.meetings.map((x) => (x.id === m.id ? { ...x, ...p } : x)) }));
-  useEffect(() => {
-    setThoughts(m.thoughts ?? '');
-    setFolder(m.folder ?? '');
-  }, [m.id]);
-  useEffect(() => {
-    const k = (e: KeyboardEvent) => {
-      if (['TEXTAREA', 'INPUT'].includes((e.target as HTMLElement).tagName)) return;
-      if (e.key === 'Escape') onBack();
-      if (e.key === 'j' && list[i - 1]) setOpen(list[i - 1].id);
-      if (e.key === 'k' && list[i + 1]) setOpen(list[i + 1].id);
-    };
-    document.addEventListener('keydown', k);
-    return () => document.removeEventListener('keydown', k);
-  });
-  return (
-    <main className="page nt-l2">
-      <div className="nt-l2-head">
-        <button className="btn btn-ghost btn-sm" onClick={onBack}>
-          <ArrowLeft size={16} /> Back
-        </button>
-        <div className="row-gap" style={{ gap: 4 }}>
-          <button className="icon-btn" data-tip="Previous (J)" disabled={!list[i - 1]} onClick={() => list[i - 1] && setOpen(list[i - 1].id)}>
-            <ChevronUp size={18} />
-          </button>
-          <button className="icon-btn" data-tip="Next (K)" disabled={!list[i + 1]} onClick={() => list[i + 1] && setOpen(list[i + 1].id)}>
-            <ChevronDown size={18} />
-          </button>
-        </div>
-      </div>
-      <input className="nt-l2-title nt-title-input" value={m.title} onChange={(e) => patch({ title: e.target.value })} aria-label="Meeting title" />
-      <div className="muted row-gap" style={{ padding: '0 8px 12px', gap: 8 }}>
-        {dayKey(m.ts)} · {time(m.ts)} · {m.minutes} min
-        <span style={{ flex: 1 }} />
-        <Folder size={14} />
-        <input
-          className="nt-folder-input"
-          placeholder="Add to folder"
-          value={folder}
-          onChange={(e) => setFolder(e.target.value)}
-          onBlur={() => patch({ folder: folder.trim() || undefined })}
-          onKeyDown={(e) => e.key === 'Enter' && (e.target as HTMLInputElement).blur()}
-        />
-      </div>
-      <div className="nt-l2-card">
-        <div className="pill-tabs">
-          {(
-            [
-              ['thoughts', 'My thoughts'],
-              ['summary', 'Summary'],
-              ['transcript', 'Transcript'],
-            ] as const
-          ).map(([id, label]) => (
-            <button key={id} className={`pill-tab ${tab === id ? 'active' : ''}`} onClick={() => setTab(id)}>
-              {label}
-            </button>
-          ))}
-        </div>
-        {tab === 'summary' && (
-          <div className="nt-l2-body">
-            <div className="caps muted">Overview</div>
-            <SummaryStatus m={m} />
-            {!!m.actionItems?.length && (
-              <>
-                <div className="caps muted" style={{ marginTop: 16 }}>
-                  Action items
-                </div>
-                <ul>
-                  {m.actionItems.map((a, k) => (
-                    <li key={k}>{a}</li>
-                  ))}
-                </ul>
-              </>
-            )}
-          </div>
-        )}
-        {tab === 'transcript' && (
-          <div className="nt-l2-body">
-            {m.transcript?.length ? (
-              m.transcript.map((s, k) => (
-                <p key={k} style={{ marginBottom: 10 }}>
-                  <span className="muted small">{clock(s.t)}</span> {s.text}
-                </p>
-              ))
-            ) : (
-              <p className="muted">{m.demo ? 'Demo notes have no transcript.' : 'No transcript was recorded.'}</p>
-            )}
-          </div>
-        )}
-        {tab === 'thoughts' && (
-          <textarea
-            className="nt-thoughts"
-            placeholder="Write your own notes..."
-            value={thoughts}
-            onChange={(e) => {
-              setThoughts(e.target.value);
-              patch({ thoughts: e.target.value });
-            }}
-          />
-        )}
-      </div>
     </main>
   );
 }

@@ -20,7 +20,8 @@ import { Confirm, Dialog, Dropdown, Switch } from '../components/ui';
 import { useCalendar } from '../native/useCalendar';
 import { toggleTheme } from '../components/Shell';
 import { native } from '../native/bridge';
-import { DEFAULT_MIC, LANGUAGES, MODELS, SPEECH_ENGINES, UNLOAD_OPTIONS, type McpInfo, type WhisperStatus } from '../shared/ipc';
+import { DEFAULT_MIC, LANGUAGES, SPEECH_ENGINES, UNLOAD_OPTIONS, type AiUsageStatus, type McpInfo, type WhisperStatus } from '../shared/ipc';
+import { BUDGETS, FEATURE_LABEL, FEATURE_SWITCHES, MODEL_IDS, MODEL_NAMES, MODEL_SETTINGS, usd, type AiFeature, type ModelName } from '../shared/aiUsage';
 import { demoData } from '../seed';
 import { useShortcutLabel } from './ShortcutsEditor';
 
@@ -766,7 +767,7 @@ function AiKey() {
           desc={
             status?.hasKey ? (
               <>
-                Saved in your macOS Keychain ({status.hint}). Used for clean-up ({MODELS.quick}), Transforms, summaries and Ask ({MODELS.smart}).
+                Saved in your macOS Keychain ({status.hint}). Choose which model each feature uses, and a monthly budget, below.
               </>
             ) : (
               <>Paste a key from console.anthropic.com. It is encrypted with your Keychain and never leaves the app except to call Claude.</>
@@ -841,6 +842,95 @@ function AiKey() {
   );
 }
 
+/** Claude spending: this month's total against the budget, model per feature, and per-feature switches */
+function AiSpending() {
+  const settings = useStore((s) => s.settings);
+  const [st, setSt] = useState<AiUsageStatus | null>(null);
+  useEffect(() => {
+    if (!native) return;
+    void native.invoke('ai:usage').then(setSt);
+    return native.on('ai:usage', setSt);
+  }, []);
+  useEffect(() => {
+    void native?.invoke('ai:usage').then(setSt); // the budget setting changed
+  }, [settings.aiBudget]);
+  if (!native) return null;
+  const u = st?.usage;
+  const pct = st?.budget ? Math.min(100, ((u?.usd ?? 0) / st.budget) * 100) : 0;
+  const month = u ? new Date(`${u.month}-01T12:00:00`).toLocaleDateString('en-US', { month: 'long' }) : '';
+  const rows = u ? (Object.entries(u.byFeature) as [AiFeature, { usd: number; requests: number }][]).sort((a, b) => b[1].usd - a[1].usd) : [];
+  const modelName = (id: string) => (Object.entries(MODEL_IDS).find(([, v]) => v === id)?.[0] ?? id) as string;
+  return (
+    <>
+      <Section title="Claude spending">
+        <Card>
+          <Row
+            label={`Spent in ${month || 'this month'}`}
+            desc={
+              st?.state === 'over'
+                ? 'Budget used up: Claude features are paused until next month or until you raise the budget. Dictation and transcripts keep working.'
+                : `Estimated from the tokens each request used and Anthropic's published prices. ${u?.requests ?? 0} request${u?.requests === 1 ? '' : 's'} so far. The Anthropic Console shows the exact bill.`
+            }
+          >
+            <span className={`spend-total ${st?.state ?? ''}`}>
+              {usd(u?.usd ?? 0)}
+              {st?.budget ? <small> of {usd(st.budget)}</small> : null}
+            </span>
+          </Row>
+          {!!st?.budget && (
+            <div className="set-row">
+              <div className={`spend-bar ${st.state}`}>
+                <i style={{ width: `${pct}%` }} />
+              </div>
+            </div>
+          )}
+          {rows.length > 0 && (
+            <div className="set-row spend-rows">
+              {rows.map(([f, x]) => (
+                <div key={f}>
+                  <span>{FEATURE_LABEL[f] ?? f}</span>
+                  <span className="muted">{x.requests}×</span>
+                  <b>{usd(x.usd)}</b>
+                </div>
+              ))}
+              {Object.keys(u!.byModel).length > 1 && (
+                <div className="muted small">
+                  By model: {Object.entries(u!.byModel).map(([m, x]) => `${modelName(m)} ${usd(x.usd)}`).join(' · ')}
+                </div>
+              )}
+            </div>
+          )}
+          <Row label="Monthly budget" desc="Warns at 80%. At 100%, Claude features pause until the 1st of next month. For a hard cap that also covers other apps, set a spend limit in the Anthropic Console too.">
+            <Dropdown value={(settings.aiBudget as string) || 'No limit'} options={BUDGETS} onChange={(x) => setSetting('aiBudget', x)} width={140} />
+          </Row>
+        </Card>
+      </Section>
+      <Section title="Models">
+        <Card>
+          {MODEL_SETTINGS.map((r) => (
+            <Row key={r.key} label={r.label} desc={`${r.desc}. Default ${r.def}.`}>
+              <Dropdown value={(settings[r.key] as ModelName) || r.def} options={MODEL_NAMES} onChange={(x) => setSetting(r.key, x)} width={140} />
+            </Row>
+          ))}
+          <Row label="Dictation polish" desc="Always Haiku 5.5: it has to answer in under 0.9 s. Turn it on or off with “Clean up dictation with Claude” above." />
+          <div className="set-row">
+            <span className="small muted">Per million tokens, input / output: Haiku 5.5 $0.10 / $0.50 · Sonnet 5.5 $2 / $10 · Opus 5.5 $4 / $20.</span>
+          </div>
+        </Card>
+      </Section>
+      <Section title="Claude features">
+        <Card>
+          {FEATURE_SWITCHES.map((r) => (
+            <Row key={r.key} label={r.label} desc={r.desc}>
+              <Switch on={settings[r.key] !== false} onChange={(x) => setSetting(r.key, x)} label={r.label} />
+            </Row>
+          ))}
+        </Card>
+      </Section>
+    </>
+  );
+}
+
 function Account() {
   const user = useStore((s) => s.user);
   const [first, setFirst] = useState(user.firstName);
@@ -882,6 +972,7 @@ function Account() {
         </div>
       </Card>
       <AiKey />
+      <AiSpending />
     </Page>
   );
 }

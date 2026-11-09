@@ -31,17 +31,27 @@ export function cleanTranscript(text: string): string {
 
 /** POST a 16 kHz mono WAV to a running whisper-server and return the cleaned transcript */
 export async function postInference(baseUrl: string, wav: Uint8Array, opts: { language?: string; prompt?: string; timeoutMs?: number } = {}): Promise<string> {
+  return (await postInferenceDetailed(baseUrl, wav, opts, false)).text;
+}
+
+/** like postInference, but also returns the language Whisper detected ("french", "english"…) when asked to */
+export async function postInferenceDetailed(
+  baseUrl: string,
+  wav: Uint8Array,
+  opts: { language?: string; prompt?: string; timeoutMs?: number } = {},
+  verbose = true,
+): Promise<{ text: string; language?: string }> {
   const form = new FormData();
   form.append('file', new Blob([wav as Uint8Array<ArrayBuffer>], { type: 'audio/wav' }), 'audio.wav');
-  form.append('response_format', 'json');
+  form.append('response_format', verbose ? 'verbose_json' : 'json');
   form.append('language', opts.language || 'auto');
   form.append('temperature', '0');
   if (opts.prompt) form.append('prompt', opts.prompt);
   const r = await fetch(`${baseUrl}/inference`, { method: 'POST', body: form, signal: AbortSignal.timeout(Math.max(1000, Math.round(opts.timeoutMs ?? 180_000))) });
   if (!r.ok) throw new Error(`whisper-server HTTP ${r.status}`);
-  const j = (await r.json()) as { text?: string; error?: string };
+  const j = (await r.json()) as { text?: string; error?: string; language?: string };
   if (j.error) throw new Error(`whisper-server: ${j.error}`);
-  return cleanTranscript(j.text ?? '');
+  return { text: cleanTranscript(j.text ?? ''), language: typeof j.language === 'string' ? j.language : undefined };
 }
 
 /** move the models RoyFlow downloaded (same volume: a rename, no copy) when this app has none yet.
@@ -276,6 +286,12 @@ export class WhisperServer extends EventEmitter {
   async transcribe(wav: Uint8Array, opts: { language?: string; prompt?: string; timeoutMs?: number } = {}): Promise<string> {
     await this.start();
     return postInference(`http://127.0.0.1:${this.port}`, wav, opts);
+  }
+
+  /** transcribe and report the detected language (meetings, language "auto") */
+  async transcribeDetailed(wav: Uint8Array, opts: { language?: string; prompt?: string; timeoutMs?: number } = {}): Promise<{ text: string; language?: string }> {
+    await this.start();
+    return postInferenceDetailed(`http://127.0.0.1:${this.port}`, wav, opts);
   }
 
   private killProc() {

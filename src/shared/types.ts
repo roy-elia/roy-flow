@@ -59,6 +59,18 @@ export interface TranscriptSegment {
   /** seconds from the start of the recording */
   t: number;
   text: string;
+  /** English translation ("Translate to English") */
+  tr?: string;
+  /** wall-clock time the words were spoken (ms) */
+  at?: number;
+}
+export interface SummaryBullet {
+  text: string;
+  sub?: string[];
+}
+export interface SummarySection {
+  heading: string;
+  bullets: SummaryBullet[];
 }
 export interface Meeting {
   id: string;
@@ -76,6 +88,15 @@ export interface Meeting {
   shared?: boolean;
   folder?: string;
   demo?: boolean;
+  /** headed sections of the summary (overview holds the one-paragraph short version) */
+  sections?: SummarySection[];
+  /** language Whisper detected, e.g. "french" */
+  language?: string;
+  /** show the English translation of the transcript */
+  translated?: boolean;
+  rating?: 'up' | 'down';
+  /** summary progress shown in the note: 1 finishing the transcript, 2 writing the summary */
+  step?: 1 | 2;
 }
 export interface Transform {
   id: string;

@@ -15,6 +15,7 @@ import * as ai from './ai';
 import { audioDir, audioPath, getData, hasData, loadData, patchData, pruneAudio, saveNow, wipeAll } from './data';
 import { rmSync } from 'node:fs';
 import { migrateModels, WhisperServer } from './whisper';
+import { addUsage, budgetState, budgetUsd, currentMonth, featureOn, FEATURE_LABEL, modelFor, usd, type AiFeature, type UsageMonth } from '../src/shared/aiUsage';
 import { toWhisperWav } from './wav';
 import { correctionPairs, glossaryPrompt, LEARN_CHECK_AFTER_MS } from '../src/shared/learn';
 import { addToClaude, mcpInfo, startMcpServer, stopMcpServer } from './mcpServer';
@@ -34,6 +35,7 @@ import {
   type EventChannels,
   type FlowBarConfig,
   type MeetingStatus,
+  type AiUsageStatus,
   type NavRequest,
   type StoreMutation,
   type TransformChange,
@@ -117,6 +119,8 @@ let devices: string[] = [];
 let hub: BrowserWindow | null = null;
 let bar: BrowserWindow | null = null;
 let scratch: BrowserWindow | null = null;
+/** the live note panel while Notetaker records */
+let live: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let quitting = false;
 const helper = new Helper(HELPER_BIN);
@@ -125,7 +129,7 @@ const helper = new Helper(HELPER_BIN);
 function sendTo<K extends keyof EventChannels>(win: BrowserWindow | null, ch: K, payload?: EventChannels[K]) {
   if (win && !win.isDestroyed()) win.webContents.send(ch, payload);
 }
-const windows = () => [hub, bar, scratch].filter((w): w is BrowserWindow => !!w && !w.isDestroyed());
+const windows = () => [hub, bar, scratch, live].filter((w): w is BrowserWindow => !!w && !w.isDestroyed());
 const broadcast = <K extends keyof EventChannels>(ch: K, payload?: EventChannels[K]) => windows().forEach((w) => sendTo(w, ch, payload));
 /** a notice on the Flow Bar (and a toast in the hub when it is focused) */
 function notice(text: string, tone?: 'error', action?: { id: string; label: string }) {
@@ -1031,7 +1035,56 @@ function showChanges() {
   sendTo(bar, 'flowbar:changes', lastChange);
 }
 
+/* ------------------------------------------------------------------ Claude spending controls */
+/* Model per feature and on/off switches come from Settings › Account; every response's token usage is priced and
+   added to this month's total (ai-usage.json). At 80% of the monthly budget a notification warns once; at 100%
+   Claude features pause until the next month or a higher budget. Dictation and transcripts never need Claude. */
+let aiUsage: UsageMonth | null = null;
+const usageNow = () => (aiUsage = currentMonth(aiUsage ?? readJson<UsageMonth | null>('ai-usage.json', null)));
+function aiBudget() {
+  return budgetUsd(setting('aiBudget', 'No limit'));
+}
+function aiUsageStatus(): AiUsageStatus {
+  const u = usageNow();
+  const budget = aiBudget();
+  return { usage: u, budget, state: budgetState(u.usd, budget) };
+}
+function installAiControls() {
+  ai.setControls({
+    modelFor: (f: AiFeature) => modelFor(f, D().settings ?? {}),
+    blocked: (f: AiFeature) => {
+      if (f !== 'test' && !featureOn(f, D().settings ?? {})) return `${FEATURE_LABEL[f]} with Claude is turned off in Settings › Account.`;
+      const u = usageNow();
+      const budget = aiBudget();
+      if (f !== 'test' && budgetState(u.usd, budget) === 'over')
+        return `Your monthly Claude budget of ${usd(budget!)} is used up (${usd(u.usd)} spent). Raise it in Settings › Account, or wait until next month.`;
+      return null;
+    },
+    record: (f, model, usage) => {
+      const prev = usageNow();
+      const next = addUsage(prev, f, model, usage);
+      const budget = aiBudget();
+      const state = budgetState(next.usd, budget);
+      if (state !== 'ok' && !next.warned) {
+        next.warned = true;
+        notify(
+          state === 'over' ? 'Claude budget used up' : 'Claude budget at 80%',
+          `${usd(next.usd)} of your ${usd(budget!)} monthly budget is spent.${state === 'over' ? ' Claude features are paused until next month.' : ''}`,
+          'suggestion',
+          () => showHub({ settings: 'account' }),
+        );
+      }
+      aiUsage = next;
+      writeJson('ai-usage.json', next);
+      broadcast('ai:usage', aiUsageStatus());
+    },
+  });
+}
+
 /* ------------------------------------------------------------------ Notetaker (meeting recording) */
+/* With Whisper (the default) the helper cuts the mic into short WAV chunks at pauses; each chunk is transcribed
+   in order while the meeting goes on, with the language detected per chunk (Wispr's "French detected").
+   Stop saves the note at once, opens it in the hub, finishes the queued chunks, then writes the summary. */
 interface MeetingRun {
   id: string;
   startedAt: number;
@@ -1042,32 +1095,152 @@ interface MeetingRun {
   timers: NodeJS.Timeout[];
   warned: boolean;
   error?: string;
+  engine: 'whisper' | 'apple';
+  chunkDir?: string;
+  /** chunk transcriptions run one after another */
+  queue: Promise<void>;
+  pending: number;
+  langVotes: Record<string, number>;
+  language?: string;
+  translate: boolean;
+  thoughts: string;
+  /** seconds already in a resumed note */
+  offset: number;
+  resumed: boolean;
+  stage: 'recording' | 'finishing';
 }
 let meeting: MeetingRun | null = null;
+/** a stopped meeting whose last chunks are still being transcribed */
+let finishing: MeetingRun | null = null;
 let meetingFinal: ((ok: boolean) => void) | null = null;
 
 const MAX_LEN: Record<string, number> = { '30 min': 30, '1 hour': 60, '2 hours': 120, '4 hours': 240 };
+const isEnglish = (lang?: string) => !lang || /^(english|en)$/i.test(lang);
 function meetingStatus(): MeetingStatus {
-  return meeting
-    ? { recording: true, startedAt: meeting.startedAt, title: meeting.title, partial: meeting.partial, segments: meeting.segments, error: meeting.error }
+  const m = meeting ?? finishing;
+  return m
+    ? {
+        recording: !!meeting,
+        startedAt: m.startedAt,
+        title: m.title,
+        partial: m.partial,
+        segments: m.segments,
+        error: m.error,
+        id: m.id,
+        stage: m.stage,
+        pending: m.pending,
+        language: m.language,
+        translate: m.translate,
+        thoughts: m.thoughts,
+        engine: m.engine,
+        offset: m.offset,
+      }
     : { recording: false, startedAt: 0, title: '', partial: '', segments: [] };
 }
 let statusTimer: NodeJS.Timeout | undefined;
 function pushMeetingStatus() {
   clearTimeout(statusTimer);
-  statusTimer = setTimeout(() => broadcast('meeting:status', meetingStatus()), 120);
+  statusTimer = setTimeout(() => {
+    broadcast('meeting:status', meetingStatus());
+  }, 120);
 }
 
-async function startMeeting(title?: string): Promise<{ ok: boolean; error?: string }> {
-  if (meeting) return { ok: true };
+/* ---- the live note panel: a narrow window on the right edge while Notetaker records (Wispr's side panel) */
+function showLive() {
+  if (live && !live.isDestroyed()) {
+    live.showInactive();
+    sendTo(live, 'meeting:status', meetingStatus());
+    return;
+  }
+  const area = screen.getPrimaryDisplay().workArea;
+  const saved = readJson<Partial<Bounds>>('live-note-window.json', {});
+  const width = saved.width ?? 440;
+  const height = saved.height ?? Math.min(820, area.height - 40);
+  const pos = saved.x !== undefined && visibleOnSomeDisplay(saved as Bounds) ? { x: saved.x, y: saved.y } : { x: area.x + area.width - width - 16, y: area.y + 20 };
+  live = new BrowserWindow({
+    title: 'Live note',
+    width,
+    height,
+    ...pos,
+    minWidth: 360,
+    minHeight: 420,
+    titleBarStyle: 'hidden',
+    trafficLightPosition: { x: 14, y: 16 },
+    backgroundColor: D().theme === 'dark' ? '#1f1f1e' : '#ffffff',
+    show: false,
+    webPreferences,
+  });
+  live.setAlwaysOnTop(true, 'floating');
+  live.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+  loadPage(live, 'index.html', '?window=livenote');
+  live.once('ready-to-show', () => {
+    live?.showInactive();
+    sendTo(live, 'meeting:status', meetingStatus());
+  });
+  const save = () => live && !live.isDestroyed() && writeJson('live-note-window.json', live.getNormalBounds());
+  live.on('moved', save);
+  live.on('resized', save);
+  live.on('closed', () => (live = null));
+}
+function closeLive() {
+  if (live && !live.isDestroyed()) live.close();
+  live = null;
+}
+
+/** the engine for a meeting: Whisper whenever it is chosen and its files are there (chunks wait while the
+    model loads or compiles, so nothing is lost), else Apple Speech */
+function meetingEngine(): 'whisper' | 'apple' {
+  if (setting('engine', 'whisper') !== 'whisper') return 'apple';
+  const st = whisper.status();
+  return st.binary && st.model === 'ready' ? 'whisper' : 'apple';
+}
+
+async function startMeeting(title?: string, resumeId?: string): Promise<{ ok: boolean; error?: string }> {
+  if (meeting) {
+    showLive();
+    return { ok: true };
+  }
+  if (finishing) return { ok: false, error: 'Notetaker is still finishing the last note. Try again in a moment.' };
   if (phase === 'recording' || phase === 'processing') return { ok: false, error: 'Finish your dictation first.' };
   if (!helper.available) return { ok: false, error: 'Native helper missing.' };
   const now = Date.now();
+  const prev = resumeId ? meetingsList().find((x) => x.id === resumeId) : undefined;
+  if (resumeId && !prev) return { ok: false, error: 'That note no longer exists.' };
   const ev = calendar.events.find((e) => !e.allDay && e.start - 5 * 60_000 <= now && e.end >= now);
-  meeting = { id: uid(), startedAt: now, title: title || ev?.title || `Meeting ${new Date(now).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}`, segments: [], partial: '', lastVoice: now, timers: [], warned: false };
+  const engine = meetingEngine();
+  const id = prev?.id ?? uid();
+  const offset = prev ? (prev.durationSec ?? prev.minutes * 60) : 0;
+  meeting = {
+    id,
+    startedAt: now,
+    title: prev?.title ?? (title || ev?.title || 'New note'),
+    segments: [...(prev?.transcript ?? [])],
+    partial: '',
+    lastVoice: now,
+    timers: [],
+    warned: false,
+    engine,
+    chunkDir: engine === 'whisper' ? path.join(app.getPath('temp'), `royflow-meeting-${id}-${now}`) : undefined,
+    queue: Promise.resolve(),
+    pending: 0,
+    langVotes: {},
+    language: prev?.language,
+    translate: !!prev?.translated,
+    thoughts: prev?.thoughts ?? '',
+    offset,
+    resumed: !!prev,
+    stage: 'recording',
+  };
   session = 'meeting';
   const mic = setting('microphone', DEFAULT_MIC);
-  helper.send({ cmd: 'start', mode: 'meeting', locale: LANGUAGE_LOCALES[setting('language', 'English')] ?? 'en-US', device: mic === DEFAULT_MIC ? '' : mic });
+  helper.send({
+    cmd: 'start',
+    mode: 'meeting',
+    locale: LANGUAGE_LOCALES[setting('language', 'English')] ?? 'en-US',
+    device: mic === DEFAULT_MIC ? '' : mic,
+    ...(engine === 'whisper' ? { engine: 'whisper', chunks: meeting.chunkDir } : {}),
+  });
+  if (engine === 'whisper') void whisper.start().catch(() => {}); // load (or compile) the model while people talk
   const maxMin = MAX_LEN[setting('maxRecording', '2 hours')] ?? 120;
   meeting.timers.push(
     setInterval(() => {
@@ -1083,7 +1256,8 @@ async function startMeeting(title?: string): Promise<{ ok: boolean; error?: stri
     }, 5000),
   );
   sound('start');
-  log('[meeting] started');
+  log('[meeting] started', { engine, resumed: !!prev });
+  if (setting('liveTranscript', true) !== false) showLive();
   pushMeetingStatus();
   pushBarConfig();
   updateBarVisibility();
@@ -1092,10 +1266,70 @@ async function startMeeting(title?: string): Promise<{ ok: boolean; error?: stri
   return { ok: true };
 }
 
+/** a chunk the helper closed: transcribe it after the ones before it */
+function onMeetingChunk(file: string, start: number) {
+  const m = meeting ?? finishing;
+  if (!m || m.engine !== 'whisper' || !m.chunkDir || !file.startsWith(m.chunkDir)) return void rmSync(file, { force: true });
+  m.pending++;
+  pushMeetingStatus();
+  m.queue = m.queue.then(async () => {
+    try {
+      const { wav, seconds } = toWhisperWav(new Uint8Array(readFileSync(file)));
+      const t0 = Date.now();
+      const r = await whisper.transcribeDetailed(wav, { language: 'auto', prompt: glossaryPrompt(D().dictionary ?? []), timeoutMs: 20 * 60_000 });
+      log('[meeting] chunk', { audioSeconds: Math.round(seconds * 10) / 10, ms: Date.now() - t0, chars: r.text.length, language: r.language });
+      if (r.text) {
+        const seg: TranscriptSegment = { t: Math.round((m.offset + start) * 10) / 10, text: r.text, at: m.startedAt + start * 1000 };
+        m.segments.push(seg);
+        if (r.language && r.text.length >= 12) {
+          m.langVotes[r.language] = (m.langVotes[r.language] ?? 0) + r.text.length;
+          m.language = Object.entries(m.langVotes).sort((a, b) => b[1] - a[1])[0][0];
+        }
+        if (m.translate && !isEnglish(m.language)) void translateSegments(m.segments, () => pushMeetingStatus());
+      }
+    } catch (e) {
+      log('[meeting] chunk failed', String(e));
+      m.error = `A part of the recording could not be transcribed: ${(e as Error).message ?? e}`;
+    } finally {
+      rmSync(file, { force: true });
+      m.pending--;
+      pushMeetingStatus();
+    }
+  });
+}
+
+/** fill in .tr (English) for segments that have none; Claude, in batches */
+const translating = new WeakSet<TranscriptSegment>();
+async function translateSegments(segs: TranscriptSegment[], onUpdate: () => void) {
+  const todo = segs.filter((s) => !s.tr && !translating.has(s));
+  if (!todo.length) return;
+  todo.forEach((s) => translating.add(s));
+  try {
+    for (let i = 0; i < todo.length; i += 40) {
+      const batch = todo.slice(i, i + 40);
+      const out = await ai.translateLines(batch.map((s) => s.text));
+      batch.forEach((s, k) => (s.tr = out[k] || s.text));
+      onUpdate();
+    }
+  } finally {
+    todo.forEach((s) => translating.delete(s));
+  }
+}
+
+function saveMeetingNote(m: MeetingRun, patch: Partial<Meeting>) {
+  const exists = meetingsList().some((x) => x.id === m.id);
+  if (exists) mutate({ collection: 'meetings', op: 'patch', id: m.id, patch });
+  else mutate({ collection: 'meetings', op: 'add', item: { id: m.id, title: m.title, ts: m.startedAt, minutes: 1, people: 1, overview: '', actionItems: [], ...patch } as Meeting });
+}
+
 async function stopMeeting(reason?: string) {
   const m = meeting;
   if (!m) return;
   m.timers.forEach((t) => clearInterval(t));
+  m.stage = 'finishing';
+  meeting = null;
+  finishing = m;
+  pushMeetingStatus();
   const ok = await new Promise<boolean>((resolve) => {
     const t = setTimeout(() => resolve(false), 9000);
     meetingFinal = (v) => {
@@ -1105,49 +1339,65 @@ async function stopMeeting(reason?: string) {
     helper.send({ cmd: 'stop' });
   });
   meetingFinal = null;
-  meeting = null;
   session = null;
   if (!ok) log('[meeting] stop timed out');
-  if (m.partial.trim() && !m.segments.some((s) => s.text === m.partial.trim())) m.segments.push({ t: (Date.now() - m.startedAt) / 1000, text: m.partial.trim() });
+  if (m.partial.trim() && !m.segments.some((s) => s.text === m.partial.trim())) m.segments.push({ t: m.offset + (Date.now() - m.startedAt) / 1000, text: m.partial.trim() });
+  m.partial = '';
   sound('stop');
-  const durationSec = Math.round((Date.now() - m.startedAt) / 1000);
-  const rec: Meeting = {
-    id: m.id,
+  const durationSec = m.offset + Math.round((Date.now() - m.startedAt) / 1000);
+  const base: Partial<Meeting> = {
     title: m.title,
-    ts: m.startedAt,
     minutes: Math.max(1, Math.round(durationSec / 60)),
     durationSec,
-    people: 1,
-    overview: '',
-    transcript: m.segments,
-    actionItems: [],
-    summaryStatus: m.segments.length ? (ai.hasKey() ? 'pending' : 'nokey') : 'done',
+    transcript: [...m.segments],
+    thoughts: m.thoughts,
+    language: m.language,
+    translated: m.translate,
+    summaryStatus: 'pending',
+    step: 1,
   };
-  mutate({ collection: 'meetings', op: 'add', item: rec });
-  log('[meeting] saved', { segments: m.segments.length, durationSec });
+  if (!m.resumed) base.ts = m.startedAt;
+  saveMeetingNote(m, base);
+  log('[meeting] saved', { segments: m.segments.length, durationSec, pending: m.pending });
   if (reason) notify('Notetaker stopped', `${reason}. Your note “${m.title}” was saved.`, 'notetaker');
-  pushMeetingStatus();
+  // Wispr: the panel turns into the full note in the main window
+  closeLive();
+  showHub({ page: 'notetaker', meeting: m.id });
   pushBarConfig();
   updateBarVisibility();
   updateTrayTitle();
   rebuildMenus();
-  if (rec.summaryStatus === 'pending') void summarize(rec);
+  await m.queue; // the last chunks
+  if (m.chunkDir) rmSync(m.chunkDir, { recursive: true, force: true });
+  finishing = null;
+  pushMeetingStatus();
+  const transcript = [...m.segments].sort((a, b) => a.t - b.t);
+  const canSummarize = ai.hasKey() && featureOn('summaries', D().settings ?? {});
+  saveMeetingNote(m, { transcript, language: m.language, step: 2, summaryStatus: transcript.length ? (canSummarize ? 'pending' : ai.hasKey() ? 'done' : 'nokey') : 'done' });
+  const rec = meetingsList().find((x) => x.id === m.id);
+  if (rec && transcript.length && canSummarize) {
+    const r = await summarize(rec);
+    if (r.ok) {
+      const done = meetingsList().find((x) => x.id === m.id);
+      notify('Your notes are ready', `That was ${done?.minutes ?? 1} min. Here's the short version.`, 'notetaker', () => showHub({ page: 'notetaker', meeting: m.id }));
+    }
+  } else saveMeetingNote(m, { step: undefined });
 }
 
 async function summarize(m: Meeting): Promise<{ ok: boolean; error?: string }> {
   if (!m.transcript?.length) return { ok: false, error: 'This note has no transcript to summarise.' };
   if (!ai.hasKey()) {
-    mutate({ collection: 'meetings', op: 'patch', id: m.id, patch: { summaryStatus: 'nokey' } });
+    mutate({ collection: 'meetings', op: 'patch', id: m.id, patch: { summaryStatus: 'nokey', step: undefined } });
     return { ok: false, error: new ai.NoKeyError().message };
   }
-  mutate({ collection: 'meetings', op: 'patch', id: m.id, patch: { summaryStatus: 'pending' } });
+  mutate({ collection: 'meetings', op: 'patch', id: m.id, patch: { summaryStatus: 'pending', step: 2 } });
   try {
     const s = await ai.summarizeMeeting(m);
-    mutate({ collection: 'meetings', op: 'patch', id: m.id, patch: { title: s.title, overview: s.overview, actionItems: s.actionItems, summaryStatus: 'done', summaryError: undefined } });
+    mutate({ collection: 'meetings', op: 'patch', id: m.id, patch: { title: /^(New note|Untitled|Meeting [A-Z][a-z]{2} \d)/.test(m.title) ? s.title : m.title, overview: s.overview, sections: s.sections, actionItems: s.actionItems, summaryStatus: 'done', summaryError: undefined, step: undefined } });
     return { ok: true };
   } catch (e) {
     const error = ai.errorText(e);
-    mutate({ collection: 'meetings', op: 'patch', id: m.id, patch: { summaryStatus: 'error', summaryError: error } });
+    mutate({ collection: 'meetings', op: 'patch', id: m.id, patch: { summaryStatus: 'error', summaryError: error, step: undefined } });
     return { ok: false, error };
   }
 }
@@ -1167,6 +1417,9 @@ helper.on('message', (m: HelperMessage) => {
       permissionHint = false;
       interim = String(m.text ?? '');
       if (phase === 'recording') broadcast('dictation:status', { phase, interim, kind: 'dictation' });
+      break;
+    case 'chunk':
+      onMeetingChunk(String(m.path ?? ''), Number(m.start) || 0);
       break;
     case 'segment':
       if (meeting) {
@@ -1233,8 +1486,10 @@ helper.on('message', (m: HelperMessage) => {
         if (['mic-denied', 'speech-denied', 'unavailable', 'no-input', 'audio', 'busy'].includes(String(m.code))) {
           const err = String(m.message ?? 'Notetaker could not record');
           meeting.timers.forEach((t) => clearInterval(t));
+          if (meeting.chunkDir) rmSync(meeting.chunkDir, { recursive: true, force: true });
           meeting = null;
           session = null;
+          closeLive();
           notice(err, 'error');
           broadcast('meeting:status', { ...meetingStatus(), error: err });
           pushBarConfig();
@@ -1789,6 +2044,7 @@ function wireIpc() {
     return { version: app.getVersion(), packaged: app.isPackaged, fullName, dataDir: app.getPath('userData') };
   });
   ipcMain.handle('ai:status', () => ({ hasKey: ai.hasKey(), encryption: ai.encryptionAvailable(), hint: ai.keyHint() }));
+  ipcMain.handle('ai:usage', () => aiUsageStatus());
   ipcMain.handle('ai:setKey', (_e, { key }: { key: string }) => ai.setKey(String(key ?? '')));
   ipcMain.handle('ai:clearKey', () => ai.clearKey());
   ipcMain.handle('ai:test', () => ai.testKey());
@@ -1849,8 +2105,49 @@ function wireIpc() {
     const m = meetingsList().find((x) => x.id === id);
     return m ? summarize(m) : { ok: false, error: 'Meeting not found' };
   });
-  ipcMain.handle('meeting:start', (_e, { title }: { title?: string }) => startMeeting(title));
+  ipcMain.handle('meeting:start', (_e, { title, resumeId }: { title?: string; resumeId?: string }) => startMeeting(title, resumeId));
   ipcMain.handle('meeting:stop', () => stopMeeting());
+  ipcMain.handle('meeting:translate', async (_e, { on, id }: { on: boolean; id?: string }) => {
+    if (on && !ai.hasKey()) return { ok: false, error: 'Translating uses Claude. ' + new ai.NoKeyError().message };
+    const run = meeting ?? finishing;
+    try {
+      if (!id || id === run?.id) {
+        if (!run) return { ok: false, error: 'Notetaker is not recording.' };
+        run.translate = on;
+        pushMeetingStatus();
+        if (on) await translateSegments(run.segments, () => pushMeetingStatus());
+        return { ok: true };
+      }
+      const rec = meetingsList().find((x) => x.id === id);
+      if (!rec) return { ok: false, error: 'Meeting not found' };
+      mutate({ collection: 'meetings', op: 'patch', id, patch: { translated: on } });
+      if (on) {
+        const segs = (rec.transcript ?? []).map((x) => ({ ...x }));
+        await translateSegments(segs, () => mutate({ collection: 'meetings', op: 'patch', id, patch: { transcript: segs.map((x) => ({ ...x })) } }));
+      }
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: ai.errorText(e) };
+    }
+  });
+  ipcMain.handle('meeting:catchup', async (_e, { question }: { question?: string }) => {
+    const run = meeting ?? finishing;
+    if (!run) return { ok: false, error: 'Notetaker is not recording.' };
+    if (!run.segments.length) return { ok: true, text: 'Nothing has been said yet.' };
+    try {
+      return { ok: true, text: await ai.catchUp(run.segments, question, run.offset + (Date.now() - run.startedAt) / 1000) };
+    } catch (e) {
+      return { ok: false, error: ai.errorText(e) };
+    }
+  });
+  ipcMain.handle('meeting:thoughts', (_e, { text, title }: { text?: string; title?: string }) => {
+    const run = meeting ?? finishing;
+    if (!run) return;
+    if (text !== undefined) run.thoughts = String(text);
+    if (title !== undefined) run.title = String(title).trim() || 'New note';
+  });
+  ipcMain.handle('meeting:live', (_e, { show }: { show: boolean }) => (show ? meeting && showLive() : closeLive()));
+  ipcMain.handle('meeting:open', (_e, { id }: { id: string }) => showHub({ page: 'notetaker', meeting: id }));
   ipcMain.handle('audio:get', (_e, { file }: { file: string }) => {
     const p = audioPath(String(file));
     if (!p || !existsSync(p)) return null;
@@ -1965,6 +2262,34 @@ async function runWhisperSelfTest(file: string) {
     result.cleaned = cleanUp(applyDictionary(fin.text, dict).text, 'Medium');
     log('[selftest] transcript:', fin.text);
     code = fin.text.trim() ? 0 : 2;
+    if (process.env.ROYFLOW_SELFTEST_AI) {
+      // one real key test (Haiku, a few tokens) through the spending controls
+      result.aiTest = await ai.testKey();
+      result.aiUsage = aiUsageStatus();
+    }
+    if (process.env.ROYFLOW_SELFTEST_MEETING) {
+      // the Notetaker path: two helper chunks -> ordered Whisper transcription with language detection
+      const now = Date.now();
+      const run: MeetingRun = {
+        id: 'selftest', startedAt: now, title: 'New note', segments: [], partial: '', lastVoice: now, timers: [], warned: false, engine: 'whisper',
+        chunkDir: path.join(app.getPath('temp'), `royflow-meeting-selftest-${now}`), queue: Promise.resolve(), pending: 0, langVotes: {}, translate: false,
+        thoughts: '', offset: 0, resumed: false, stage: 'recording',
+      };
+      mkdirSync(run.chunkDir!, { recursive: true });
+      finishing = run;
+      const t2 = Date.now();
+      [0, 1].forEach((k) => {
+        const f = path.join(run.chunkDir!, `0000${k + 1}.wav`);
+        copyFileSync(file, f);
+        onMeetingChunk(f, k * 10);
+      });
+      result.meetingPendingAfterQueue = run.pending;
+      await run.queue;
+      finishing = null;
+      result.meeting = { ms: Date.now() - t2, segments: run.segments, language: run.language, pending: run.pending, chunksLeft: readdirSync(run.chunkDir!).length, error: run.error };
+      rmSync(run.chunkDir!, { recursive: true, force: true });
+      if (run.segments.length !== 2 || run.pending !== 0) code = 3;
+    }
   } catch (e) {
     result.error = String(e);
     log('[selftest] failed', String(e));
@@ -1978,6 +2303,7 @@ async function runWhisperSelfTest(file: string) {
 
 app.whenReady().then(async () => {
   loadData();
+  installAiControls();
   if (SELFTEST_WAV) return void runWhisperSelfTest(SELFTEST_WAV);
   if (!hasData()) {
     // first run: main creates the data file, so it never depends on a hub window being open

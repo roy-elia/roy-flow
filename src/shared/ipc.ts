@@ -1,3 +1,4 @@
+import type { UsageMonth } from './aiUsage';
 /* IPC contract between the Electron main process, the preload bridge and the renderers.
    Type-only plus the channel allow-lists, so it can be bundled into main, preload and the web build. */
 import type { ChatMessage, HistoryItem, Meeting, TranscriptSegment, VoiceProfile } from './types';
@@ -75,6 +76,13 @@ export interface CalendarState {
   events: CalEvent[];
 }
 
+export interface AiUsageStatus {
+  usage: UsageMonth;
+  /** monthly budget in dollars; null = no limit */
+  budget: number | null;
+  state: 'ok' | 'warn' | 'over';
+}
+
 export interface MeetingStatus {
   recording: boolean;
   startedAt: number;
@@ -82,6 +90,19 @@ export interface MeetingStatus {
   partial: string;
   segments: TranscriptSegment[];
   error?: string;
+  /** the note this recording is saved to (a resumed note keeps its id) */
+  id?: string;
+  /** "finishing": stopped, the last chunks are still being transcribed */
+  stage?: 'recording' | 'finishing';
+  /** Whisper chunks still being transcribed (the "…" bubble) */
+  pending?: number;
+  /** language Whisper detected, e.g. "french" */
+  language?: string;
+  translate?: boolean;
+  thoughts?: string;
+  engine?: 'whisper' | 'apple';
+  /** seconds already recorded in a resumed note (the timer continues from here) */
+  offset?: number;
 }
 
 export interface McpInfo {
@@ -149,12 +170,18 @@ export interface InvokeChannels {
   'ai:setKey': { args: { key: string }; result: { ok: boolean; error?: string } };
   'ai:clearKey': { args: void; result: void };
   'ai:test': { args: void; result: { ok: boolean; error?: string; model?: string; ms?: number } };
+  'ai:usage': { args: void; result: AiUsageStatus };
   'ai:cleanup': { args: { id: string }; result: { ok: boolean; error?: string } };
   'ai:transform': { args: { text: string; prompt: string; name: string }; result: { ok: boolean; text?: string; error?: string } };
   'ai:ask': { args: { id: string; messages: ChatMessage[] }; result: { ok: boolean; error?: string } };
   'ai:voice': { args: void; result: { ok: boolean; profile?: VoiceProfile; error?: string } };
   'meeting:summarize': { args: { id: string }; result: { ok: boolean; error?: string } };
-  'meeting:start': { args: { title?: string }; result: { ok: boolean; error?: string } };
+  'meeting:start': { args: { title?: string; resumeId?: string }; result: { ok: boolean; error?: string } };
+  'meeting:translate': { args: { on: boolean; id?: string }; result: { ok: boolean; error?: string } };
+  'meeting:catchup': { args: { question?: string }; result: { ok: boolean; text?: string; error?: string } };
+  'meeting:thoughts': { args: { text?: string; title?: string }; result: void };
+  'meeting:live': { args: { show: boolean }; result: void };
+  'meeting:open': { args: { id: string }; result: void };
   'meeting:stop': { args: void; result: void };
   'audio:get': { args: { file: string }; result: Uint8Array | null };
   'audio:extract': { args: { file: string; name: string }; result: { ok: boolean; path?: string } };
@@ -189,18 +216,19 @@ export interface EventChannels {
   'ai:done': { id: string; error?: string };
   toast: { text: string; tone?: 'success' | 'error' };
   'whisper:status': WhisperStatus;
+  'ai:usage': AiUsageStatus;
 }
 
 export const SEND_CHANNELS: (keyof SendChannels)[] = ['store:patch', 'dictation:toggle', 'dictation:cancel', 'flowbar:interactive', 'flowbar:ready', 'hub:open', 'hotkeys:record', 'scratchpad:open', 'scratchpad:close', 'meeting:toggle', 'flowbar:action', 'flowbar:expand'];
 export const INVOKE_CHANNELS: (keyof InvokeChannels)[] = [
   'store:load', 'store:export', 'store:reset', 'access:check', 'access:open', 'hotkeys:apply', 'devices:get', 'app:info',
-  'ai:status', 'ai:setKey', 'ai:clearKey', 'ai:test', 'ai:cleanup', 'ai:transform', 'ai:ask', 'ai:voice',
-  'meeting:summarize', 'meeting:start', 'meeting:stop', 'audio:get', 'audio:extract', 'calendar:get', 'mcp:info', 'mcp:addClaude', 'notify:test',
+  'ai:status', 'ai:setKey', 'ai:clearKey', 'ai:test', 'ai:usage', 'ai:cleanup', 'ai:transform', 'ai:ask', 'ai:voice',
+  'meeting:summarize', 'meeting:start', 'meeting:stop', 'meeting:translate', 'meeting:catchup', 'meeting:thoughts', 'meeting:live', 'meeting:open', 'audio:get', 'audio:extract', 'calendar:get', 'mcp:info', 'mcp:addClaude', 'notify:test',
   'whisper:status', 'whisper:download', 'apps:installed',
 ];
 export const EVENT_CHANNELS: (keyof EventChannels)[] = [
   'nav', 'dictation:status', 'dictation:level', 'dictation:result', 'store:changed', 'store:mutate', 'flowbar:config', 'flowbar:changes', 'flowbar:mic',
-  'flowbar:note', 'access:changed', 'hotkeys:keys', 'meeting:status', 'calendar:changed', 'ai:chunk', 'ai:done', 'toast', 'whisper:status',
+  'flowbar:note', 'access:changed', 'hotkeys:keys', 'meeting:status', 'calendar:changed', 'ai:chunk', 'ai:done', 'toast', 'whisper:status', 'ai:usage',
 ];
 
 export interface RoyFlowBridge {
