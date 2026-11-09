@@ -204,3 +204,25 @@ Not verified live (and why):
 - Left/right-specific modifiers (Wispr's "left_right_same" rule) are not distinguished; ⌥ means either ⌥.
 - No AX read-back that the paste landed (Wispr's `DictatedTextVerification`), no "click a text box" hint.
 - Speaker labels, meeting import, team sharing and cloud sync do not exist in the local app (hidden).
+
+## 1.3 + RoyFlow merge (branch `claude/royflow-merge`)
+
+RoyFlow (`~/Downloads/dictation-overlay`) is retired; its engine and unique features now live here. Its own
+settings window, pill and UI were not ported.
+
+| Feature | Where | Notes |
+|---|---|---|
+| Speech engine: **Whisper** (default) or Apple Speech | Settings › General › Speech engine | Whisper: the helper records only (`start` with `"engine":"whisper"`, no SFSpeechRecognizer), main converts the WAV to 16 kHz mono Int16 (`electron/wav.ts`) and posts it to a managed `whisper-server` (`electron/whisper.ts`) with the dictionary as a `Glossary:` prompt; the text then goes through the unchanged pipeline (clean-up, style, dictionary, snippets, Claude, paste, history, stats). History items carry `speech: 'whisper' \| 'apple'`. No live text while recording with Whisper. |
+| Fallback to Apple Speech | automatic | while the model is missing/downloading, during the one-time Core ML compile ("Preparing speech model…" on the Flow Bar), or after the server failed to start; a note says why (at most every 10 min). |
+| Models | `~/Library/Application Support/Roy Flow/models` | moved (rename, no copy) from `…/RoyFlow/models` on first run; Settings shows status, and Download with progress when missing (large-v3-turbo q5_0 + Core ML encoder from huggingface). |
+| Memory saver | Settings › General | unload after 5/15 (default)/60 min idle or keep loaded; a dictation key-down reloads it (Flow Bar: "Loading speech model…"). |
+| whisper-server | `vendor/whisper/whisper-server` → `Resources/whisper/whisper-server` | arm64, Metal + Core ML, static (`scripts/build-whisper.sh`); signed by `scripts/sign.sh` before the bundle. |
+| Learn from my edits | Settings › System › Extras (default on) | helper `focusedText` reads the focused field's AXValue (secure fields skipped); checks 6/15/30 s after a paste and before the next dictation; `src/shared/learn.ts` (RoyFlow's `corrections()`); adds through main's store patch, Flow Bar "Added “X” to your dictionary". |
+| Focus Mode | Settings › System › Focus Mode | helper reports app activations and hides by pid (`hide`). |
+| New microphone offer | Settings › System › Extras (default on) | helper listens for CoreAudio device changes; physical devices only (no Zoom/Teams virtual devices); Flow Bar "{mic} connected · Switch". |
+| 20-minute cap | dictation | "1 minute left" at 19 min, stops and pastes at 20 min. |
+| Already in Roy Flow (not re-ported) | | Esc cancel with Undo (6 s, re-transcribes the cancelled audio with Whisper only when Undo is pressed), "Using {mic}" tip. |
+
+Notetaker stays on Apple Speech (live segments). Self-test: `ROYFLOW_SELFTEST_WAV=x.wav "Roy Flow.app/Contents/MacOS/Roy Flow"`
+runs a WAV through the Whisper engine path (no windows, no single-instance lock, data read-only) and writes
+`~/Library/Logs/Roy Flow/whisper-selftest.json` (or `ROYFLOW_SELFTEST_OUT`).

@@ -46,6 +46,10 @@ describe('whisper transcribe client', () => {
     expect(body).toMatch(/name="response_format"\r\n\r\njson\r\n/);
     expect(body).toMatch(/name="temperature"\r\n\r\n0\r\n/);
   });
+  it('accepts a fractional timeout (audio seconds × factor)', async () => {
+    reply = { status: 200, body: { text: 'ok then' } };
+    expect(await postInference(base, wav, { timeoutMs: 74416.125 })).toBe('ok then');
+  });
   it('omits an empty prompt and defaults to auto language', async () => {
     seen.length = 0;
     await postInference(base, wav);

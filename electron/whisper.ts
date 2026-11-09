@@ -37,7 +37,7 @@ export async function postInference(baseUrl: string, wav: Uint8Array, opts: { la
   form.append('language', opts.language || 'auto');
   form.append('temperature', '0');
   if (opts.prompt) form.append('prompt', opts.prompt);
-  const r = await fetch(`${baseUrl}/inference`, { method: 'POST', body: form, signal: AbortSignal.timeout(opts.timeoutMs ?? 180_000) });
+  const r = await fetch(`${baseUrl}/inference`, { method: 'POST', body: form, signal: AbortSignal.timeout(Math.max(1000, Math.round(opts.timeoutMs ?? 180_000))) });
   if (!r.ok) throw new Error(`whisper-server HTTP ${r.status}`);
   const j = (await r.json()) as { text?: string; error?: string };
   if (j.error) throw new Error(`whisper-server: ${j.error}`);
