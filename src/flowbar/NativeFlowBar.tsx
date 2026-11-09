@@ -35,6 +35,8 @@ export default function NativeFlowBar() {
   const [tip, setTip] = useState<string | null>(null);
   const [changes, setChanges] = useState<TransformChange | null>(null);
   const noteTimer = useRef(0);
+  const [mic, setMic] = useState<string | null>(null);
+  const micTimer = useRef(0);
 
   const notify = (n: Note, ms = 4000) => {
     setNote(n);
@@ -59,7 +61,10 @@ export default function NativeFlowBar() {
           setNote(null);
           setChanges(null);
         }
-        if (s.phase !== 'recording') setLevels(Array(BARS).fill(0.15));
+        if (s.phase !== 'recording') {
+          setLevels(Array(BARS).fill(0.15));
+          setMic(null);
+        }
         if (s.phase === 'error' && s.error) notify({ text: s.error, tone: 'error' }, 5000);
       }),
       native.on('dictation:level', (v) => {
@@ -71,6 +76,12 @@ export default function NativeFlowBar() {
         const short = t.length > 48 ? t.slice(0, 48) + '…' : t;
         if (r.note) notify({ text: r.note, tone: 'error' }, 6000);
         else notify(r.pasted ? { text: `Pasted: “${short}”` } : { text: r.reason ?? 'Copied to the clipboard' }, r.pasted ? 3000 : 6000);
+      }),
+      native.on('flowbar:mic', (label) => {
+        // like Wispr's "Using {mic}": only on a new session or device, and only briefly
+        setMic(label);
+        window.clearTimeout(micTimer.current);
+        micTimer.current = window.setTimeout(() => setMic(null), 1500);
       }),
       native.on('flowbar:note', (n) => notify(n, n.action ? 6000 : n.tone === 'error' ? 6000 : 4000)),
       native.on('flowbar:changes', (c) => {
@@ -110,7 +121,8 @@ export default function NativeFlowBar() {
   }, []);
 
   // grow the panel window only while there is more than the pill to draw
-  const expanded = !!(changes || note || tip || (phase === 'recording' && (interim || cfg.creatorMode)) || (phase === 'processing' && kindLabel));
+  // (the short mic label fits the small bottom panel; side docks need the wider one)
+  const expanded = !!(changes || note || tip || (phase === 'recording' && (interim || cfg.creatorMode || (mic && cfg.dock !== 'bottom'))) || (phase === 'processing' && kindLabel));
   useEffect(() => {
     native?.send('flowbar:expand', expanded);
   }, [expanded]);
@@ -157,6 +169,11 @@ export default function NativeFlowBar() {
               {note.action.label}
             </button>
           )}
+        </div>
+      )}
+      {phase === 'recording' && mic && !note && (
+        <div className="fb-mic-label" role="status">
+          {mic}
         </div>
       )}
       {phase === 'recording' && interim && <div className="fb-live">{interim}</div>}

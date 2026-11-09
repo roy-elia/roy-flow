@@ -50,7 +50,8 @@ export function defaultSettings(): Record<string, string | boolean> {
       connected_outlook: false,
       notetakerAutoPromptDismissed: false,
       autoCleanup: 'Medium',
-      aiCleanup: true,
+      aiCleanup: false,
+      migrated13: true,
     };
 }
 

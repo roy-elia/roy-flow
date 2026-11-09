@@ -18,7 +18,8 @@ import { addToClaude, mcpInfo, startMcpServer, stopMcpServer } from './mcpServer
 import { applyDictionary, applySnippets, changedWords, cleanUp, styleText, wordCount } from '../src/shared/textPipeline';
 import { allActions, bindingsOf, chordLabel, defaultHotkeyMap, helperBindings, toAccelerator, type HotkeyMap } from '../src/shared/hotkeys';
 import { categoryFor, styleKeyFor, type HistoryItem, type Meeting, type State, type Transform, type TranscriptSegment } from '../src/shared/types';
-import { applyMutation, emptyState, retainHistory } from '../src/shared/state';
+import { applyMutation, emptyState, migrateSettings, retainHistory } from '../src/shared/state';
+import { micLabelToShow, pickFinalText, summarizeTimings, withTimeout, type DictationTiming } from '../src/shared/latency';
 import {
   DEFAULT_MIC,
   LANGUAGE_LOCALES,
@@ -409,7 +410,22 @@ interface Final {
   text: string;
   audio: string | null;
   seconds: number;
+  via?: string;
 }
+
+/* ---- latency instrumentation: per-dictation timings (never text) to main.log + Help › Show Dictation Timing */
+const timings: DictationTiming[] = [];
+let timing: DictationTiming & { keyDownAt: number; keyUpAt?: number; finalAt?: number } = { at: '', keyDownAt: 0 };
+function recordTiming(t: DictationTiming) {
+  timings.push(t);
+  if (timings.length > 50) timings.shift();
+  log('[timing]', t);
+}
+function showTimings() {
+  void dialog.showMessageBox({ type: 'info', message: 'Dictation timing', detail: summarizeTimings(timings) + '\n\nEach dictation is also logged to main.log as [timing].', buttons: ['OK'] });
+}
+/** Flow Bar mic label: shown briefly on the first dictation of a session and when the input device changes */
+let lastMicLabel: string | null = null;
 let finalWaiter: ((f: Final) => void) | null = null;
 let session: 'dictation' | 'meeting' | null = null;
 
@@ -437,7 +453,9 @@ async function startDictation(how: 'toggle' | 'ptt') {
   permissionHint = false;
   mode = how;
   startedAt = Date.now();
+  timing = { at: new Date().toISOString(), keyDownAt: how === 'ptt' && pttDownAt ? pttDownAt : startedAt };
   pendingId = uid();
+  if (claudeCleanupOn() || autoApplyOn()) ai.warmConnection();
   positionBar(true);
   frontApp = { bundleId: '', name: '' };
   if (setting('contextAwareness', true))
@@ -467,17 +485,18 @@ const heard = () => (permissionHint ? '' : interim);
 /** recordings shorter than this, or with no words, are dropped without a message */
 const MIN_RECORDING_MS = 400;
 
-/** stop the helper and wait for its final transcript (falls back to the last partial after 5 s) */
+/** stop the helper and wait for its final transcript. The helper answers within ~150 ms tail + 600 ms;
+    if it does not, fall back to the last partial after 1.5 s. */
 function finishRecording(): Promise<Final> {
   return new Promise<Final>((resolve) => {
     const t = setTimeout(() => {
       finalWaiter = null;
-      resolve({ text: heard(), audio: null, seconds: (Date.now() - startedAt) / 1000 });
-    }, 5000);
+      resolve({ text: heard(), audio: null, seconds: (Date.now() - startedAt) / 1000, via: 'fallback' });
+    }, 1500);
     finalWaiter = (f) => {
       clearTimeout(t);
       finalWaiter = null;
-      resolve({ ...f, text: f.text || heard() });
+      resolve({ ...f, text: pickFinalText(f.text, heard()) });
     };
     helper.send({ cmd: 'stop' });
   });
@@ -486,9 +505,15 @@ function finishRecording(): Promise<Final> {
 async function stopDictation() {
   if (phase !== 'recording') return;
   const heldMs = Date.now() - startedAt;
+  timing.keyUpAt = Date.now();
   setPhase('processing', { kind: 'dictation' });
   mute(false);
+  // read the clipboard (to restore it after pasting) while the helper finishes, not after
+  const savedClip = saveClipboard();
   const fin = await finishRecording();
+  timing.finalAt = Date.now();
+  timing.stopToFinalMs = timing.finalAt - timing.keyUpAt;
+  timing.finalVia = fin.via;
   session = null;
   const raw = fin.text.trim();
   if (!raw || heldMs < MIN_RECORDING_MS) {
@@ -499,7 +524,7 @@ async function stopDictation() {
     return setPhase('idle');
   }
   sound('stop');
-  await deliver(raw, fin, pendingId, startedAt, frontApp);
+  await deliver(raw, fin, pendingId, startedAt, frontApp, await savedClip, timing);
   interim = '';
   setPhase('idle');
 }
@@ -509,9 +534,14 @@ function discardAudio(file: string | null) {
 }
 
 /** clean up, paste and record one dictation */
-async function deliver(raw: string, fin: Final, id: string, ts: number, app: { bundleId: string; name: string }) {
+async function deliver(raw: string, fin: Final, id: string, ts: number, app: { bundleId: string; name: string }, savedClip?: ClipboardItem[], t?: typeof timing) {
   const out = await processDictation(raw, app);
-  const res = await pasteText(out.text);
+  const res = await pasteText(out.text, savedClip);
+  if (t?.keyUpAt) {
+    const now = Date.now();
+    const { keyDownAt: _k, keyUpAt, finalAt, ...rest } = t;
+    recordTiming({ ...rest, finalToPasteMs: finalAt ? now - finalAt : undefined, totalMs: now - keyUpAt, engine: out.engine, audioSeconds: fin.seconds, chars: out.text.length });
+  }
   const item: HistoryItem = {
     id,
     ts,
@@ -591,8 +621,15 @@ function toggleDictation() {
   else if (phase === 'idle' || phase === 'error') startDictation('toggle');
 }
 
-/** clean-up (Claude Haiku or rules), style per app category, dictionary, snippets, optional auto-applied Transform */
-async function processDictation(raw: string, target: { bundleId: string; name: string }): Promise<{ text: string; fixes: number; dictFixes: number; engine: 'claude' | 'rules'; note?: string }> {
+const claudeCleanupOn = () => ai.hasKey() && setting('aiCleanup', false);
+const autoApplyOn = () => setting('autoApply', false) && setting('transformsOptIn', true) && ai.hasKey();
+/** live dictation budgets: the rules result is pasted if Claude is not back in time */
+const CLEANUP_TIMEOUT_MS = 900;
+const AUTO_APPLY_TIMEOUT_MS = 4000;
+
+/** clean-up (rules, instant; Claude Haiku only when enabled, with a hard timeout), style per app category,
+    dictionary, snippets, optional auto-applied Transform. `live` = a dictation waiting to be pasted. */
+async function processDictation(raw: string, target: { bundleId: string; name: string }, live = true): Promise<{ text: string; fixes: number; dictFixes: number; engine: 'claude' | 'rules'; note?: string }> {
   const dict = (D().dictionary ?? []).map((w) => ({ word: w.word, misspelling: w.misspelling }));
   const snippets = (D().snippets ?? []).map((s) => ({ trigger: s.trigger, expansion: s.expansion }));
   const category = categoryFor(target.bundleId);
@@ -601,19 +638,24 @@ async function processDictation(raw: string, target: { bundleId: string; name: s
   const codeAware = category === 'code' && setting('codeAware', true);
   const level = codeAware ? 'Light' : setting('autoCleanup', 'Medium');
   const d1 = applyDictionary(raw, dict);
-  let text = '';
+  // rule-based clean-up is synchronous: this is what gets pasted unless Claude answers within the budget
+  const rules = codeAware ? cleanUp(d1.text, 'Light') : styleText(cleanUp(d1.text, level), style);
+  let text = rules;
   let engine: 'claude' | 'rules' = 'rules';
   let note: string | undefined;
-  if (ai.hasKey() && setting('aiCleanup', true)) {
+  if (claudeCleanupOn()) {
+    const budget = live ? CLEANUP_TIMEOUT_MS : 8000;
     try {
-      text = await ai.cleanupDictation(d1.text, { level, style: codeAware ? 'code' : style, app: target.name, category });
-      engine = 'claude';
+      const t0 = Date.now();
+      const out = await withTimeout(ai.cleanupDictation(d1.text, { level, style: codeAware ? 'code' : style, app: target.name, category, timeoutMs: budget }), budget, () => '');
+      if (out) {
+        text = out;
+        engine = 'claude';
+      } else log('[ai] cleanup over budget, pasted rules version', { ms: Date.now() - t0 });
     } catch (e) {
-      note = `${ai.errorText(e)} Used basic clean-up instead.`;
-      log('[ai] cleanup failed', note);
+      log('[ai] cleanup failed, pasted rules version', ai.errorText(e));
     }
   }
-  if (!text) text = codeAware ? cleanUp(d1.text, 'Light') : styleText(cleanUp(d1.text, level), style);
   const d2 = applyDictionary(text, dict);
   const u = D().user;
   const sn = applySnippets(d2.text, snippets, { first: u?.firstName, last: u?.lastName, email: u?.email });
@@ -621,10 +663,13 @@ async function processDictation(raw: string, target: { bundleId: string; name: s
   if (setting('autoApply', false) && setting('transformsOptIn', true)) {
     const t = transforms().find((x) => x.name === setting('autoApplyTransform', 'Polish'));
     if (t && ai.hasKey()) {
+      const budget = live ? AUTO_APPLY_TIMEOUT_MS : 45_000;
       try {
-        const after = await ai.runTransform(text, t.prompt, t.name);
-        rememberChange({ name: t.name, before: text, after });
-        text = after;
+        const after = await withTimeout(ai.runTransform(text, t.prompt, t.name, budget), budget, () => '');
+        if (after) {
+          rememberChange({ name: t.name, before: text, after });
+          text = after;
+        } else note = `${t.name} took too long, so the text was pasted without it.`;
       } catch (e) {
         note = `${t.name} was not applied: ${ai.errorText(e)}`;
       }
@@ -823,7 +868,7 @@ const toggleMeeting = () => (meeting ? void stopMeeting() : void startMeeting().
 
 /* ------------------------------------------------------------------ helper messages */
 helper.on('message', (m: HelperMessage) => {
-  if (!['level', 'partial', 'keys', 'segment', 'access'].includes(m.type)) log('[helper]', m.type === 'final' ? { type: 'final', chars: String(m.text ?? '').length } : m);
+  if (!['level', 'partial', 'keys', 'segment', 'access'].includes(m.type)) log('[helper]', m.type === 'final' ? { type: 'final', chars: String(m.text ?? '').length, via: m.via, stopMs: m.stopMs } : m);
   switch (m.type) {
     case 'partial':
       if (session === 'meeting' && meeting) {
@@ -851,6 +896,15 @@ helper.on('message', (m: HelperMessage) => {
       break;
     case 'started':
       if (typeof m.ms === 'number') log('[dictation] mic started', { ms: m.ms, device: m.device });
+      if (m.mode !== 'meeting' && phase === 'recording') {
+        timing.helperStartMs = typeof m.ms === 'number' ? m.ms : undefined;
+        timing.keyToMicMs = Date.now() - timing.keyDownAt;
+        const label = micLabelToShow(String(m.deviceName || m.device || ''), lastMicLabel);
+        if (label) {
+          lastMicLabel = label;
+          sendTo(bar, 'flowbar:mic', label);
+        }
+      }
       if (phase === 'recording' && permissionHint) {
         permissionHint = false;
         interim = '';
@@ -865,7 +919,7 @@ helper.on('message', (m: HelperMessage) => {
     }
     case 'final':
       if (m.mode === 'meeting') meetingFinal?.(true);
-      else finalWaiter?.({ text: String(m.text ?? ''), audio: typeof m.audio === 'string' ? m.audio : null, seconds: Number(m.seconds) || 0 });
+      else finalWaiter?.({ text: String(m.text ?? ''), audio: typeof m.audio === 'string' ? m.audio : null, seconds: Number(m.seconds) || 0, via: typeof m.via === 'string' ? m.via : undefined });
       break;
     case 'hotkey':
       onHotkey(String(m.action), String(m.phase));
@@ -1063,12 +1117,13 @@ async function accessibilityTrusted(prompt = false): Promise<boolean> {
 async function pasteText(text: string, restore?: ClipboardItem[]): Promise<{ pasted: boolean; reason?: string }> {
   const saved = restore ?? (await saveClipboard());
   await clipboard.writeText(text);
-  if (!(await accessibilityTrusted())) {
+  await new Promise((r) => setTimeout(r, 15));
+  // the helper checks Accessibility itself before posting ⌘V (one round trip instead of two)
+  const r = await helper.request<{ type: 'pasted'; ok: boolean; reason?: string }>({ cmd: 'paste' }, 'pasted');
+  if (r?.reason === 'accessibility') {
     void checkAccess(false);
     return { pasted: false, reason: 'Copied to the clipboard. Allow Accessibility access so Roy Flow can paste for you.' };
   }
-  await new Promise((r) => setTimeout(r, 30));
-  const r = await helper.request<{ type: 'pasted'; ok: boolean }>({ cmd: 'paste' }, 'pasted');
   if (!r?.ok) return { pasted: false, reason: 'Copied to the clipboard (paste failed).' };
   // give the target app time to read the pasteboard, then put back what was there
   setTimeout(async () => {
@@ -1270,6 +1325,7 @@ const menuContext = (): MenuContext => ({
   copyLast,
   version: app.getVersion(),
   logMetrics: () => void logMetrics(true),
+  showTimings,
   setSetting: (key, value) => mainPatch({ settings: { ...(D().settings ?? {}), [key]: value } }),
   quit: () => {
     quitting = true;
@@ -1442,7 +1498,7 @@ function wireIpc() {
     const h = (D().history ?? []).find((x) => x.id === id);
     if (!h) return { ok: false, error: 'Transcript not found' };
     const raw = h.original ?? h.text;
-    const out = await processDictation(raw, { bundleId: h.bundleId ?? '', name: h.app ?? '' }).catch(() => null);
+    const out = await processDictation(raw, { bundleId: h.bundleId ?? '', name: h.app ?? '' }, false).catch(() => null);
     if (!out) return { ok: false, error: 'Retry failed' };
     mutate({ collection: 'history', op: 'patch', id, patch: { text: out.text, cleaned: undefined, original: raw, fixes: out.fixes, dictFixes: out.dictFixes, engine: out.engine, words: wordCount(out.text) } });
     return { ok: true, error: out.note };
@@ -1517,6 +1573,32 @@ function wireIpc() {
   ipcMain.handle('notify:test', () => notify('Notifications are on', 'Roy Flow will let you know about milestones and meetings.', 'milestone'));
 }
 
+/* ------------------------------------------------------------------ latency test (test-only: `open -a "Roy Flow" --args --latency-test a.wav,b.wav --latency-out out.json`)
+   Runs the helper's --file mode as a child of the app, so it uses the app's Speech Recognition permission. */
+function runLatencyTest() {
+  const argv = process.argv;
+  const files = (argv[argv.indexOf('--latency-test') + 1] ?? '').split(',').filter(Boolean);
+  const outIdx = argv.indexOf('--latency-out');
+  const outFile = outIdx > 0 ? argv[outIdx + 1] : path.join(app.getPath('logs'), 'latency-test.json');
+  const results: unknown[] = [];
+  for (const f of files) {
+    for (let run = 0; run < 3; run++) {
+      try {
+        const line = execFileSync(helper.bin, ['--file', f], { encoding: 'utf8', timeout: 120_000 }).trim().split('\n').pop() ?? '{}';
+        const r = JSON.parse(line) as Record<string, unknown>;
+        results.push(r);
+        const { fast_text: _a, final_text: _b, ...noText } = r;
+        log('[latency-test]', noText);
+      } catch (e) {
+        results.push({ file: path.basename(f), error: String(e).slice(0, 200) });
+        log('[latency-test] failed', path.basename(f));
+      }
+    }
+  }
+  writeFileSync(outFile, JSON.stringify(results, null, 2));
+  app.exit(0);
+}
+
 /* ------------------------------------------------------------------ lifecycle */
 app.on('second-instance', () => showHub());
 app.on('activate', () => showHub());
@@ -1559,7 +1641,13 @@ app.whenReady().then(async () => {
     }
     patchData(s);
   }
+  const migrated = migrateSettings(D().settings);
+  if (migrated) {
+    patchData({ settings: migrated });
+    log('[app] settings migrated (1.3: Flow Bar at the bottom, Claude clean-up opt-in)');
+  }
   log('[app] ready', { version: app.getVersion(), packaged: app.isPackaged, helper: helper.available, data: hasData() });
+  if (process.argv.includes('--latency-test')) return void runLatencyTest();
   if (!isDev) serveDist();
   wireIpc();
   createTray();

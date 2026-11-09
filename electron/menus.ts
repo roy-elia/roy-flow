@@ -29,6 +29,7 @@ export interface MenuContext {
   copyLast(): void;
   version: string;
   logMetrics(): void;
+  showTimings(): void;
   setSetting(key: string, value: string | boolean): void;
   quit(): void;
 }
@@ -188,6 +189,7 @@ export function buildAppMenu(c: MenuContext): Menu {
         { label: 'Help and feedback…', click: () => c.openHub({ modal: 'help' }) },
         { label: 'Shortcuts', click: () => c.openHub({ settings: 'general', modal: 'shortcuts' }) },
         { type: 'separator' },
+        { label: 'Show Dictation Timing', click: c.showTimings },
         { label: 'Log Resource Usage', click: c.logMetrics },
       ],
     },

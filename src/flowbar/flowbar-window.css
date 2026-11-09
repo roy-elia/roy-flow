@@ -199,3 +199,20 @@ html.flowbar-window body {
 .dock-right .fb-changes {
   width: 380px;
 }
+
+/* "Built-in mic" chip: a short name, shown for 1.5 s when recording starts on a new session or device.
+   Bottom dock: centred above the pill. Side docks: beside it. */
+.fb-mic-label {
+  max-width: 200px;
+  padding: 3px 10px;
+  border-radius: 34px;
+  background: #000;
+  border: 1px solid #30302f;
+  color: #d4d4d1;
+  font-size: 12px;
+  line-height: 16px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  animation: fade-in 0.12s;
+}

@@ -138,6 +138,34 @@ final class OutputMute {
     }
 }
 
+// MARK: - When is a stopped dictation final? (pure, covered by --selftest)
+
+/// key-up -> text timing. SFSpeech's on-device isFinal often lags endAudio by 1-3 s; the last partial is already
+/// punctuated (addsPunctuation), so after a short grace period it is used instead, like Wispr's fast paste.
+enum FinalPolicy {
+    static let tail = 0.15 // keep capturing after key-up so the last word is not clipped
+    static let grace = 0.25 // after endAudio: wait this long for isFinal, then take the latest partial
+    static let hard = 0.6 // after endAudio: give up waiting even with no partial yet
+}
+
+enum FinalVia: String { case isFinal, partial, timeout, noTask }
+
+/// nil = keep waiting
+func finalDecision(elapsed: Double, gotFinal: Bool, partial: String, grace: Double = FinalPolicy.grace, hard: Double = FinalPolicy.hard) -> FinalVia? {
+    if gotFinal { return .isFinal }
+    if elapsed >= hard { return .timeout }
+    if elapsed >= grace, !partial.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return .partial }
+    return nil
+}
+
+func defaultInputName() -> String? {
+    var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultInputDevice, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+    var dev = AudioDeviceID(0)
+    var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+    guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &dev) == noErr, dev != 0 else { return nil }
+    return inputDevices().first(where: { $0.id == dev })?.name
+}
+
 // MARK: - Speech session (dictation, or a long meeting transcribed in segments)
 
 final class Dictation {
@@ -159,6 +187,11 @@ final class Dictation {
     private var segmentText = ""
     private var rotateTimer: Timer?
     private var pendingSegments = 0
+    // fast stop (dictation mode)
+    private var stopRequested = Date()
+    private var audioEndedAt = Date()
+    private var gotFinal = false
+    private var lastWarmArgs: (locale: String, device: String?)?
 
     var busy: Bool { !finished }
 
@@ -168,6 +201,7 @@ final class Dictation {
         stopping = false
         startRequested = Date()
         lastText = ""
+        gotFinal = false
         self.mode = mode
         session += 1
         let id = session
@@ -247,6 +281,10 @@ final class Dictation {
         configObserver = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main) { [weak self] _ in
             guard let self, self.finished else { return }
             self.warm = nil
+            // rebuild right away (off the key-down path) so the next dictation still starts warm
+            if let a = self.lastWarmArgs {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in self?.prewarm(locale: a.locale, device: a.device) }
+            }
         }
         warm = (engine, device, used)
         return (engine, used)
@@ -254,6 +292,7 @@ final class Dictation {
 
     /// pre-build the engine and recognizer so the first dictation starts fast (does not open the mic)
     func prewarm(locale: String, device: String?) {
+        lastWarmArgs = (locale, device)
         guard finished, AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else { return }
         let (engine, _) = engineFor(device ?? "")
         _ = engine.inputNode.outputFormat(forBus: 0)
@@ -322,11 +361,14 @@ final class Dictation {
                     guard let self, id == self.session, !self.finished else { return }
                     if let result {
                         self.lastText = result.bestTranscription.formattedString
-                        if result.isFinal { return self.finish() }
-                        emit(["type": "partial", "text": self.lastText])
+                        if result.isFinal {
+                            self.gotFinal = true
+                            return self.finish(via: .isFinal)
+                        }
+                        if !self.stopping { emit(["type": "partial", "text": self.lastText]) }
                     }
                     if let error {
-                        if self.stopping { return self.finish() }
+                        if self.stopping { return self.finish(via: .timeout) }
                         let ns = error as NSError
                         // 1110 = no speech detected, 216/301 = cancelled
                         if ns.code == 1110 || ns.code == 216 || ns.code == 301 { return }
@@ -335,7 +377,8 @@ final class Dictation {
                 }
             }
         }
-        emit(["type": "started", "onDevice": onDevice, "device": usedDevice, "mode": mode, "ms": Int(Date().timeIntervalSince(startRequested) * 1000)])
+        let deviceName = usedDevice == "default" ? (defaultInputName() ?? "") : usedDevice
+        emit(["type": "started", "onDevice": onDevice, "device": usedDevice, "deviceName": deviceName, "mode": mode, "ms": Int(Date().timeIntervalSince(startRequested) * 1000)])
     }
 
     // meeting mode: each recognition task covers ~45 s; finished tasks are reported as segments
@@ -350,7 +393,7 @@ final class Dictation {
             self.pendingSegments -= 1
             let t = latest.trimmingCharacters(in: .whitespacesAndNewlines)
             if !t.isEmpty { emit(["type": "segment", "text": t, "start": (start * 10).rounded() / 10]) }
-            if self.stopping && self.pendingSegments <= 0 { self.finish() }
+            if self.stopping && self.pendingSegments <= 0 { self.finish(via: .isFinal) }
         }
         task = recognizer.recognitionTask(with: req) { [weak self] result, error in
             DispatchQueue.main.async {
@@ -402,17 +445,37 @@ final class Dictation {
     func stop() {
         guard !finished, !stopping else { return }
         stopping = true
-        stopAudio()
-        request?.endAudio()
-        if task == nil { return finish() }
+        stopRequested = Date()
         let id = session
-        DispatchQueue.main.asyncAfter(deadline: .now() + (mode == "meeting" ? 6 : 3)) { [weak self] in
-            guard let self, id == self.session else { return }
-            self.finish()
+        if mode == "meeting" {
+            stopAudio()
+            request?.endAudio()
+            if task == nil { return finish(via: .noTask) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self] in
+                guard let self, id == self.session else { return }
+                self.finish(via: .timeout)
+            }
+            return
+        }
+        // short tail: the mic keeps running so a word spoken right at key-up is not cut off
+        DispatchQueue.main.asyncAfter(deadline: .now() + FinalPolicy.tail) { [weak self] in
+            guard let self, id == self.session, !self.finished else { return }
+            self.stopAudio()
+            self.request?.endAudio()
+            self.audioEndedAt = Date()
+            if self.task == nil { return self.finish(via: .noTask) }
+            for t in [FinalPolicy.grace, FinalPolicy.hard] {
+                DispatchQueue.main.asyncAfter(deadline: .now() + t) { [weak self] in
+                    guard let self, id == self.session, !self.finished else { return }
+                    if let via = finalDecision(elapsed: Date().timeIntervalSince(self.audioEndedAt) + 0.001, gotFinal: self.gotFinal, partial: self.lastText) {
+                        self.finish(via: via)
+                    }
+                }
+            }
         }
     }
 
-    private func finish() {
+    private func finish(via: FinalVia = .isFinal) {
         guard !finished else { return }
         finished = true
         stopAudio()
@@ -420,7 +483,8 @@ final class Dictation {
         task = nil
         request = nil
         pendingSegments = 0
-        emit(["type": "final", "text": lastText, "audio": filePath ?? NSNull(), "seconds": (Date().timeIntervalSince(startedAt) * 10).rounded() / 10, "mode": mode])
+        let stopMs = stopping ? Int(Date().timeIntervalSince(stopRequested) * 1000) : 0
+        emit(["type": "final", "text": lastText, "audio": filePath ?? NSNull(), "seconds": (Date().timeIntervalSince(startedAt) * 10).rounded() / 10, "mode": mode, "via": via.rawValue, "stopMs": stopMs])
     }
 
     func cancel() {
@@ -887,8 +951,98 @@ func runSelfTest() -> Int32 {
     flags(63, [])
     h.setRecording(false)
     check("recording captures fn", fnKeys == ["fn"])
+    // final-text timing policy
+    check("final: isFinal wins at once", finalDecision(elapsed: 0.01, gotFinal: true, partial: "") == .isFinal)
+    check("final: waits inside grace", finalDecision(elapsed: 0.1, gotFinal: false, partial: "Hello there.") == nil)
+    check("final: partial after grace", finalDecision(elapsed: 0.26, gotFinal: false, partial: "Hello there.") == .partial)
+    check("final: blank partial keeps waiting", finalDecision(elapsed: 0.4, gotFinal: false, partial: "  ") == nil)
+    check("final: hard timeout", finalDecision(elapsed: 0.61, gotFinal: false, partial: "") == .timeout)
+    check("final: hard limit <= 600 ms", FinalPolicy.hard <= 0.6 && FinalPolicy.grace <= 0.25 && FinalPolicy.tail >= 0.15)
     print(failures == 0 ? "selftest passed" : "selftest: \(failures) failed")
     return failures == 0 ? 0 : 1
+}
+
+
+// MARK: - Latency test (RoyFlowHelper --file <audio> [--locale en-US]): test-only, never used by the app
+// Streams an audio file through the same recognizer setup in real time, then runs the stop path and reports
+// endAudio -> text timings for the fast policy (tail + grace/partial) and for the old one (wait for isFinal, 3 s cap).
+func runFileLatency(path: String, locale: String) -> Int32 {
+    func out(_ o: [String: Any]) {
+        if let d = try? JSONSerialization.data(withJSONObject: o, options: [.sortedKeys]), let l = String(data: d, encoding: .utf8) { print(l) }
+    }
+    guard SFSpeechRecognizer.authorizationStatus() == .authorized || {
+        let sem = DispatchSemaphore(value: 0)
+        var ok = false
+        SFSpeechRecognizer.requestAuthorization { ok = $0 == .authorized; sem.signal() }
+        _ = sem.wait(timeout: .now() + 10)
+        return ok
+    }() else { out(["error": "speech-not-authorized"]); return 2 }
+    guard let rec = SFSpeechRecognizer(locale: Locale(identifier: locale)), rec.isAvailable else { out(["error": "recognizer-unavailable"]); return 2 }
+    guard let file = try? AVAudioFile(forReading: URL(fileURLWithPath: path)) else { out(["error": "cannot-read-file"]); return 2 }
+    rec.queue = OperationQueue() // results off the main thread: this test blocks main while feeding
+    let req = SFSpeechAudioBufferRecognitionRequest()
+    req.shouldReportPartialResults = true
+    let onDevice = rec.supportsOnDeviceRecognition
+    if onDevice { req.requiresOnDeviceRecognition = true }
+    if #available(macOS 13, *) { req.addsPunctuation = true }
+    let lock = NSLock()
+    var partial = ""
+    var finalText: String?
+    var finalAt: Date?
+    var partials = 0
+    let task = rec.recognitionTask(with: req) { result, error in
+        lock.lock(); defer { lock.unlock() }
+        if let result {
+            partial = result.bestTranscription.formattedString
+            if result.isFinal, finalAt == nil { finalText = partial; finalAt = Date() } else { partials += 1 }
+        }
+        if error != nil, finalAt == nil { finalAt = Date() }
+    }
+    // real-time feed, 1024-frame buffers like the mic tap
+    let fmt = file.processingFormat
+    let chunk: AVAudioFrameCount = 1024
+    let seconds = Double(file.length) / fmt.sampleRate
+    let feedStart = Date()
+    var fed: AVAudioFramePosition = 0
+    while fed < file.length {
+        guard let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: chunk), (try? file.read(into: buf, frameCount: chunk)) != nil, buf.frameLength > 0 else { break }
+        req.append(buf)
+        fed += AVAudioFramePosition(buf.frameLength)
+        let due = Double(fed) / fmt.sampleRate - Date().timeIntervalSince(feedStart)
+        if due > 0 { Thread.sleep(forTimeInterval: due) }
+    }
+    // "key-up": tail, then endAudio
+    let keyUp = Date()
+    Thread.sleep(forTimeInterval: FinalPolicy.tail)
+    req.endAudio()
+    let ended = Date()
+    var fast: (ms: Int, via: FinalVia, text: String)?
+    while Date().timeIntervalSince(ended) < 3.0 {
+        lock.lock()
+        let gotFinal = finalAt != nil && finalText != nil
+        let p = partial
+        let fa = finalAt
+        lock.unlock()
+        if fast == nil, let via = finalDecision(elapsed: Date().timeIntervalSince(ended), gotFinal: gotFinal, partial: p) {
+            fast = (Int(Date().timeIntervalSince(keyUp) * 1000), via, gotFinal ? (finalText ?? p) : p)
+        }
+        if fa != nil, fast != nil { break }
+        Thread.sleep(forTimeInterval: 0.005)
+    }
+    task.cancel()
+    lock.lock(); defer { lock.unlock() }
+    let words = { (t: String) in t.split(whereSeparator: { $0.isWhitespace }).count }
+    let norm = { (t: String) in t.lowercased().filter { $0.isLetter || $0.isNumber || $0 == " " } }
+    let legacyMs = finalAt.map { Int($0.timeIntervalSince(ended) * 1000) } ?? 3000
+    out([
+        "file": URL(fileURLWithPath: path).lastPathComponent, "audioSeconds": (seconds * 10).rounded() / 10, "onDevice": onDevice, "partials": partials,
+        "legacy_keyUpToFinalMs": min(legacyMs, 3000), "legacy_gotIsFinal": finalAt != nil && finalText != nil,
+        "fast_keyUpToFinalMs": fast?.ms ?? -1, "fast_via": fast?.via.rawValue ?? "none",
+        "fast_words": words(fast?.text ?? ""), "final_words": words(finalText ?? partial),
+        "fast_matches_isFinal": finalText.map { norm($0) == norm(fast?.text ?? "") } ?? false,
+        "fast_text": fast?.text ?? "", "final_text": finalText ?? "",
+    ])
+    return 0
 }
 
 // MARK: - Calendar (EventKit)
@@ -1008,6 +1162,11 @@ func handle(_ line: String) {
 }
 
 if selfTestMode { exit(runSelfTest()) }
+if let i = CommandLine.arguments.firstIndex(of: "--file"), i + 1 < CommandLine.arguments.count {
+    let args = CommandLine.arguments
+    let loc = args.firstIndex(of: "--locale").flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil } ?? "en-US"
+    exit(runFileLatency(path: args[i + 1], locale: loc))
+}
 
 Thread {
     while let line = readLine() {

@@ -56,3 +56,12 @@ export function retainHistory(history: HistoryItem[], policy: string | boolean |
   const cutoff = now - 30 * 86400_000;
   return history.some((h) => h.ts < cutoff) ? history.filter((h) => h.ts >= cutoff) : null;
 }
+
+/** one-time settings migrations (1.3): Flow Bar docks at the bottom centre like Wispr's default (the setting stays,
+    so Left/Right can be picked again), and Claude clean-up becomes opt-in so a plain dictation pastes instantly.
+    Returns the new settings, or null when nothing changes. */
+export function migrateSettings(settings: Record<string, string | boolean> | undefined): Record<string, string | boolean> | null {
+  const s = settings ?? {};
+  if (s.migrated13) return null;
+  return { ...s, flowBarDock: 'Bottom', aiCleanup: false, migrated13: true };
+}

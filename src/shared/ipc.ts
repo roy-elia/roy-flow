@@ -153,6 +153,8 @@ export interface EventChannels {
   'store:mutate': StoreMutation;
   'flowbar:config': FlowBarConfig;
   'flowbar:changes': TransformChange;
+  /** short input-device name, shown briefly over the pill when recording starts */
+  'flowbar:mic': string;
   'flowbar:note': { text: string; tone?: 'error'; action?: { id: string; label: string } };
   'access:changed': AccessStatus;
   'hotkeys:keys': string[];
@@ -170,7 +172,7 @@ export const INVOKE_CHANNELS: (keyof InvokeChannels)[] = [
   'meeting:summarize', 'meeting:start', 'meeting:stop', 'audio:get', 'audio:extract', 'calendar:get', 'mcp:info', 'mcp:addClaude', 'notify:test',
 ];
 export const EVENT_CHANNELS: (keyof EventChannels)[] = [
-  'nav', 'dictation:status', 'dictation:level', 'dictation:result', 'store:changed', 'store:mutate', 'flowbar:config', 'flowbar:changes',
+  'nav', 'dictation:status', 'dictation:level', 'dictation:result', 'store:changed', 'store:mutate', 'flowbar:config', 'flowbar:changes', 'flowbar:mic',
   'flowbar:note', 'access:changed', 'hotkeys:keys', 'meeting:status', 'calendar:changed', 'ai:chunk', 'ai:done', 'toast',
 ];
 

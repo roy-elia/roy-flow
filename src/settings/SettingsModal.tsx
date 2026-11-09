@@ -718,7 +718,7 @@ function AiKey() {
             </button>
           </div>
         )}
-        <Toggle k="aiCleanup" label="Clean up dictation with Claude" desc="Uses your Auto Cleanup level and Style choices. Without a key, Roy Flow uses basic on-device rules." />
+        <Toggle k="aiCleanup" label="Clean up dictation with Claude" desc="Off by default. Uses your Auto Cleanup level and Style choices, but never delays a paste by more than 0.9 s: if Claude is slower, the instant on-device clean-up is pasted." />
         {result && (
           <div className="set-row">
             <span className="small" style={{ color: result.ok ? 'var(--success, inherit)' : 'var(--destructive)' }}>

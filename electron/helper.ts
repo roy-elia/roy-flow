@@ -11,7 +11,7 @@ export interface HelperMessage {
 export class Helper extends EventEmitter {
   private proc: ChildProcessWithoutNullStreams | null = null;
   private buf = '';
-  constructor(private readonly bin: string) {
+  constructor(readonly bin: string) {
     super();
   }
 
