@@ -103,6 +103,10 @@ export interface MeetingStatus {
   engine?: 'whisper' | 'apple';
   /** seconds already recorded in a resumed note (the timer continues from here) */
   offset?: number;
+  /** words being said now and lines waiting for Whisper (shown greyed, replaced by Whisper's text) */
+  interim?: { who: 'you' | 'them'; text: string; t: number }[];
+  /** the Mac's sound ("Them") is being captured */
+  systemAudio?: 'on' | 'off' | 'error';
 }
 
 export interface McpInfo {

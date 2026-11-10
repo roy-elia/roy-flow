@@ -2670,3 +2670,13 @@ mark {
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
+/* the other side of a call */
+.tc-who.them {
+  color: #3d7a5a;
+}
+[data-theme='dark'] .tc-who.them {
+  color: #7cc29b;
+}
+.tc-bubble.them {
+  background: color-mix(in srgb, var(--success) 9%, var(--background-tertiary));
+}

@@ -146,6 +146,11 @@ function Toggle({ k, label, desc }: { k: string; label: ReactNode; desc?: ReactN
     </Row>
   );
 }
+/** a switch whose setting is on until turned off */
+function SwitchOn({ k, label }: { k: string; label: string }) {
+  const v = useStore((st) => st.settings[k] !== false);
+  return <Switch on={v} onChange={(x) => setSetting(k, x)} label={label} />;
+}
 function Select({ k, options, width = 200 }: { k: string; options: (string | { value: string; label: string })[]; width?: number }) {
   const v = useStore((s) => s.settings[k] as string);
   return <Dropdown value={v} options={options} onChange={(x) => setSetting(k, x)} width={width} />;
@@ -524,6 +529,9 @@ function NotetakerSettings() {
       <Section title="Transcript">
         <Card>
           <Toggle k="liveTranscript" label="Show live transcript" desc="See the words appear on the Notetaker page while it records" />
+          <Row label="Transcribe the other side of calls" desc="Also records your Mac's sound (Zoom, Teams, Meet…) and labels it Them, so others are heard even with headphones on. macOS asks once to allow audio capture.">
+            <SwitchOn k="meetingSystemAudio" label="Transcribe the other side of calls" />
+          </Row>
         </Card>
       </Section>
       <p className="small muted">Notetaker records your microphone and transcribes it on this Mac. Always tell people when you are taking notes of a call.</p>

@@ -217,9 +217,9 @@ export async function runTransform(text: string, prompt: string, name: string, t
 export async function summarizeMeeting(
   m: Meeting,
 ): Promise<{ title: string; overview: string; sections: SummarySection[]; actionItems: string[] }> {
-  const transcript = (m.transcript ?? []).map((s) => `[${fmtT(s.t)}] ${s.text}`).join('\n');
+  const transcript = (m.transcript ?? []).map((s) => line(s)).join('\n');
   const system = [
-    "You write the notes for a meeting recorded on the user's Mac (one microphone, so speakers are not labelled; the user is \"You\").",
+    "You write the notes for a meeting recorded on the user's Mac. Lines marked You come from the user's microphone; lines marked Them come from the Mac's sound (the other people on the call, not told apart).",
     'Write in the language most of the transcript is in (a French meeting gets French notes).',
     'Return JSON only, no code fence:',
     '{"title": short specific title (max 7 words, no date),',
@@ -252,7 +252,7 @@ export async function translateLines(lines: string[]): Promise<string[]> {
 
 /** "What did I miss?" during a meeting: a short answer from the live transcript */
 export async function catchUp(segments: TranscriptSegment[], question: string | undefined, nowSec: number): Promise<string> {
-  const transcript = segments.map((s) => `[${fmtT(s.t)}] ${s.text}`).join('\n');
+  const transcript = segments.map((s) => line(s)).join('\n');
   const system = [
     `You help the user during a meeting that is still going on (it is now ${fmtT(nowSec)} into the recording).`,
     'Answer from the live transcript only, briefly (a few bullets or 2-3 sentences), in the language of the question;',
@@ -261,6 +261,8 @@ export async function catchUp(segments: TranscriptSegment[], question: string | 
   return complete({ feature: 'ask', system, user: `<transcript>\n${transcript}\n</transcript>\n\n${question?.trim() || 'What did I miss?'}`, maxTokens: 1200, timeoutMs: 45_000 });
 }
 
+/** one transcript line for Claude: time, who (You = the mic, Them = the Mac's sound) and the words */
+const line = (s: TranscriptSegment) => `[${fmtT(s.t)}] ${s.who === 'them' ? 'Them' : 'You'}: ${s.text}`;
 const fmtT = (s: number) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
 
 /** context block for "Ask anything about your meetings" */
@@ -273,7 +275,7 @@ function meetingContext(meetings: Meeting[], budgetChars = 400_000): string {
       m.overview ? `Summary: ${m.overview}` : '',
       m.actionItems?.length ? `Action items: ${m.actionItems.join('; ')}` : '',
       m.thoughts ? `User's notes: ${m.thoughts}` : '',
-      m.transcript?.length ? `Transcript:\n${m.transcript.map((s) => `[${fmtT(s.t)}] ${s.text}`).join('\n')}` : '',
+      m.transcript?.length ? `Transcript:\n${m.transcript.map((s) => line(s)).join('\n')}` : '',
       '</meeting>',
     ]
       .filter(Boolean)

@@ -11,6 +11,8 @@ import path from 'node:path';
 import type { WhisperStatus } from '../src/shared/ipc';
 
 export const DEFAULT_MODEL = 'ggml-large-v3-turbo-q5_0.bin';
+/** small, fast model used only for Notetaker's live words (148 MB, runs on the GPU beside the main model) */
+export const LIVE_MODEL = 'ggml-base.bin';
 export const MODEL_URL = (name: string) => `https://huggingface.co/ggerganov/whisper.cpp/resolve/main/${name}`;
 /** ggml-large-v3-turbo-q5_0.bin -> ggml-large-v3-turbo-encoder.mlmodelc */
 export const COREML_NAME = (model: string) => model.replace(/\.bin$/, '').replace(/-q\d_\d$/, '') + '-encoder.mlmodelc';
@@ -309,7 +311,7 @@ export class WhisperServer extends EventEmitter {
   }
 
   /** download the ggml model and (Apple silicon) its Core ML encoder; restarts the server afterwards */
-  downloadModel(): Promise<void> {
+  downloadModel(opts: { coreml?: boolean } = {}): Promise<void> {
     if (this.downloading) return this.downloading;
     const d = (async () => {
       mkdirSync(this.modelsDir, { recursive: true });
@@ -318,7 +320,7 @@ export class WhisperServer extends EventEmitter {
         this.push();
       };
       if (!this.hasModel()) await download(MODEL_URL(this.model), this.modelPath, report('model'));
-      if (process.arch === 'arm64' && !this.hasCoreML()) {
+      if (opts.coreml !== false && process.arch === 'arm64' && !this.hasCoreML()) {
         const zipName = `${COREML_NAME(this.model)}.zip`;
         const zip = path.join(this.modelsDir, zipName);
         try {

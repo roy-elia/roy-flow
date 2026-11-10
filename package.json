@@ -94,6 +94,7 @@
       "darkModeSupport": true,
       "extendInfo": {
         "NSMicrophoneUsageDescription": "Roy Flow listens to your microphone while you dictate.",
+        "NSAudioCaptureUsageDescription": "Roy Flow's Notetaker transcribes the other people on your calls from your Mac's sound.",
         "NSSpeechRecognitionUsageDescription": "Roy Flow turns your speech into text, on this Mac when supported.",
         "NSAppleEventsUsageDescription": "Roy Flow pastes dictated text into the app you are using.",
         "NSCalendarsUsageDescription": "Roy Flow shows your upcoming meetings on the Notetaker page and in the menu bar.",

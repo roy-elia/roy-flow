@@ -88,6 +88,7 @@ export function TranscriptCard({
   translated,
   onTranslate,
   startedAt,
+  interim = [],
 }: {
   segs: TranscriptSegment[];
   duration: number;
@@ -98,6 +99,8 @@ export function TranscriptCard({
   translated?: boolean;
   onTranslate?: (on: boolean) => void;
   startedAt?: number;
+  /** words being said now / waiting for Whisper (greyed) */
+  interim?: { who: 'you' | 'them'; text: string; t: number }[];
 }) {
   const [q, setQ] = useState('');
   const [searching, setSearching] = useState(false);
@@ -109,7 +112,7 @@ export function TranscriptCard({
 
   useEffect(() => {
     if (atBottom && live) body.current?.scrollTo({ top: body.current.scrollHeight });
-  }, [segs.length, pending, partial, atBottom, live]);
+  }, [segs.length, pending, partial, interim, atBottom, live]);
 
   const foreign = !!language && !isEnglish(language);
   let banner: React.ReactNode = null;
@@ -154,21 +157,43 @@ export function TranscriptCard({
       </div>
     );
 
-  // a "You" label (with the time) above each run of speech; a new run after a 20 s gap
+  // a "You" / "Them" label (with the time) above each run of speech: a new run when the speaker changes or after a 20 s gap
   const rows: React.ReactNode[] = [];
+  const whoOf = (w?: string) => (w === 'them' ? 'them' : 'you');
+  const label = (w: string) => (w === 'them' ? 'Them' : 'You');
+  let lastWho = '';
+  let lastT = -1e9;
   shown.forEach((s, i) => {
-    const prev = shown[i - 1];
-    if (!prev || s.t - prev.t > 20) {
+    const w = whoOf(s.who);
+    if (w !== lastWho || s.t - lastT > 20) {
       const at = s.at ?? (startedAt ? startedAt + s.t * 1000 : undefined);
       rows.push(
-        <div key={`h${i}`} className="tc-who">
-          You {!live && at ? <span>{wallTime(at)}</span> : null}
+        <div key={`h${i}`} className={`tc-who ${w}`}>
+          {label(w)} {!live && at ? <span>{wallTime(at)}</span> : null}
         </div>,
       );
     }
+    lastWho = w;
+    lastT = s.t;
     rows.push(
-      <div key={i} className="tc-bubble" title={clock(s.t)}>
+      <div key={i} className={`tc-bubble ${w}`} title={clock(s.t)}>
         {translated && s.tr ? s.tr : s.text}
+      </div>,
+    );
+  });
+  // live words: greyed until Whisper's text replaces them
+  [...interim].sort((a, b) => a.t - b.t).forEach((x, i) => {
+    if (x.who !== lastWho) rows.push(<div key={`ih${i}`} className={`tc-who ${x.who}`}>{label(x.who)}</div>);
+    lastWho = x.who;
+    rows.push(
+      <div key={`i${i}`} className={`tc-bubble interim ${x.who}`}>
+        {x.text || (
+          <span className="tc-dots" aria-label="Transcribing">
+            <i />
+            <i />
+            <i />
+          </span>
+        )}
       </div>,
     );
   });
@@ -205,7 +230,7 @@ export function TranscriptCard({
         }}
       >
         {rows}
-        {(pending > 0 || partial) && (
+        {!interim.length && (pending > 0 || partial) && (
           <>
             {!shown.length && <div className="tc-who">You</div>}
             <div className="tc-bubble interim">{partial || <span className="tc-dots" aria-label="Transcribing">
@@ -215,7 +240,7 @@ export function TranscriptCard({
               </span>}</div>
           </>
         )}
-        {!shown.length && !pending && !partial && <div className="tc-empty">{q ? 'No matches.' : live ? 'Listening…' : 'No transcript was recorded.'}</div>}
+        {!shown.length && !pending && !partial && !interim.length && <div className="tc-empty">{q ? 'No matches.' : live ? 'Listening…' : 'No transcript was recorded.'}</div>}
       </div>
       {!atBottom && (
         <button className="tc-down" aria-label="Scroll to the latest" onClick={() => body.current?.scrollTo({ top: body.current.scrollHeight, behavior: 'smooth' })}>
@@ -643,6 +668,12 @@ export function LiveNoteApp() {
         <div className="nn-chips">
           <span className="nn-chip">Today</span>
           {st.engine === 'apple' && <span className="nn-chip muted">Apple Speech</span>}
+          {st.systemAudio === 'on' && <span className="nn-chip" title="Your mic is You; your Mac's sound (the call) is Them">You + Them</span>}
+          {st.systemAudio === 'error' && (
+            <span className="nn-chip muted" title="Roy Flow can't hear your Mac's sound, so only your mic is transcribed. Allow audio capture for Roy Flow in System Settings › Privacy & Security.">
+              Mic only
+            </span>
+          )}
         </div>
         <NoteTabs tab={tab} setTab={setTab} live={st.recording} />
         <div className="nn-body">
@@ -668,6 +699,7 @@ export function LiveNoteApp() {
               translated={st.translate}
               onTranslate={on.translate ? translate : undefined}
               startedAt={st.startedAt}
+              interim={st.interim}
             />
           )}
           {tab === 'summary' && (

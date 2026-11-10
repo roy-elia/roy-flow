@@ -20,7 +20,10 @@
 // out: {"type":"ready"} {"type":"started","onDevice":true} {"type":"partial","text":"..."}
 //      {"type":"final","text":"...","audio":"/path.wav"|null,"seconds":3.2}
 //      {"type":"segment","text":"...","start":12.5}            meeting mode: a finished stretch of speech
-//      {"type":"chunk","path":"/dir/0003.wav","start":41.2,"seconds":9.8}  meeting + Whisper: a closed chunk
+//      {"type":"chunk","path":"/dir/mic-00003.wav","start":41.2,"seconds":9.8,"source":"mic"|"system","index":3}
+//      {"type":"preview","source":"mic","path":"/dir/preview-mic.wav","index":4,"start":51,"seconds":3.2} | {"type":"preview","source":"mic","none":true}
+//      {"type":"system","ok":true|false,"error":"..."}           meeting + "system":true: the Mac's sound is (not) captured
+//      {"cmd":"preview","source":"mic"|"system"}                 in: snapshot the chunk still being spoken (live words)
 //      {"type":"level","value":0.42} {"type":"cancelled"}
 //      {"type":"pasted","ok":true} {"type":"copied","ok":true}
 //      {"type":"access","trusted":true,"listen":true,"tap":"active"|"listen"|"off"}
@@ -83,6 +86,7 @@ func inputDevices() -> [(id: AudioDeviceID, name: String)] {
         var name: Unmanaged<CFString>?
         var nameSize = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
         guard AudioObjectGetPropertyData(id, &nameAddr, 0, nil, &nameSize, &name) == noErr, let n = name?.takeRetainedValue() else { continue }
+        if (n as String) == "Roy Flow meeting tap" { continue } // Notetaker's own system-audio tap, not a microphone
         out.append((id, n as String))
     }
     return out
@@ -195,13 +199,20 @@ final class Chunker {
     private let settings: [String: Any]
     private let format: AVAudioFormat
     private let onChunk: (String, Double, Double) -> Void
+    private let prefix: String
     private var file: AVAudioFile?
     private var path = ""
     private var index = 0
     private var total = 0.0 // frames written since the start
     private var frames = 0.0, speech = 0.0, silence = 0.0 // in the open chunk
+    /// copies of the open chunk's audio, for previews (guarded by lock: written on the audio thread)
+    private var open: [AVAudioPCMBuffer] = []
+    private var openSpeech = 0.0
+    private let lock = NSLock()
+    private(set) var chunkIndex = 0
 
-    init(dir: String, settings: [String: Any], format: AVAudioFormat, onChunk: @escaping (String, Double, Double) -> Void) {
+    init(dir: String, settings: [String: Any], format: AVAudioFormat, prefix: String = "", onChunk: @escaping (String, Double, Double) -> Void) {
+        self.prefix = prefix
         self.dir = dir
         self.settings = settings
         self.format = format
@@ -214,27 +225,52 @@ final class Chunker {
         guard n > 0 else { return }
         if file == nil {
             index += 1
-            path = (dir as NSString).appendingPathComponent(String(format: "%05d.wav", index))
-            file = try? AVAudioFile(forWriting: URL(fileURLWithPath: path), settings: settings, commonFormat: .pcmFormatFloat32, interleaved: false)
+            path = (dir as NSString).appendingPathComponent(prefix + String(format: "%05d.wav", index))
+            file = try? AVAudioFile(forWriting: URL(fileURLWithPath: path), settings: settings, commonFormat: format.commonFormat, interleaved: format.isInterleaved)
         }
         try? file?.write(from: buffer)
+        if let copy = AVAudioPCMBuffer(pcmFormat: buffer.format, frameCapacity: buffer.frameLength) {
+            copy.frameLength = buffer.frameLength
+            let s = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: buffer.audioBufferList))
+            let d = UnsafeMutableAudioBufferListPointer(copy.mutableAudioBufferList)
+            for i in 0..<min(s.count, d.count) { if let sp = s[i].mData, let dp = d[i].mData { memcpy(dp, sp, Int(min(s[i].mDataByteSize, d[i].mDataByteSize))) } }
+            lock.lock(); open.append(copy); lock.unlock()
+        }
         var rms: Float = 0
         if let d = buffer.floatChannelData?[0] {
+            // interleaved buffers keep every channel in channel 0: step over the others
+            let step = buffer.format.isInterleaved ? Int(buffer.format.channelCount) : 1
             var sum: Float = 0
-            for i in 0..<Int(buffer.frameLength) { sum += d[i] * d[i] }
+            for i in 0..<Int(buffer.frameLength) { let v = d[i * step]; sum += v * v }
             rms = sqrt(sum / Float(n))
         }
         frames += n
         total += n
         if rms >= Chunker.speechRms { speech += n; silence = 0 } else { silence += n }
+        lock.lock(); openSpeech = speech / format.sampleRate; chunkIndex = index; lock.unlock()
         let rate = format.sampleRate
         if (frames / rate >= Chunker.minSeconds && silence / rate >= Chunker.pauseSeconds) || frames / rate >= Chunker.maxSeconds { close() }
+    }
+
+    /// the open chunk so far, written to `path` (for a live preview); nil when it holds too little speech
+    func preview(to path: String) -> (index: Int, start: Double, seconds: Double)? {
+        lock.lock()
+        let bufs = open, spoken = openSpeech, idx = chunkIndex
+        lock.unlock()
+        guard spoken >= 0.4, let first = bufs.first,
+              let f = try? AVAudioFile(forWriting: URL(fileURLWithPath: path), settings: settings, commonFormat: first.format.commonFormat, interleaved: first.format.isInterleaved) else { return nil }
+        var frames = 0.0
+        for b in bufs { try? f.write(from: b); frames += Double(b.frameLength) }
+        let rate = format.sampleRate
+        lock.lock(); let start = (total - self.frames) / rate; lock.unlock()
+        return (idx, start, frames / rate)
     }
 
     /// close the open chunk (also called at stop, after the tap is removed)
     func close() {
         guard file != nil else { return }
         file = nil // finalises the WAV header
+        lock.lock(); open.removeAll(); openSpeech = 0; lock.unlock()
         let rate = format.sampleRate
         let p = path, seconds = frames / rate, start = (total - frames) / rate, spoken = speech / rate
         frames = 0; speech = 0; silence = 0
@@ -244,6 +280,133 @@ final class Chunker {
         }
         let cb = onChunk
         DispatchQueue.main.async { cb(p, (start * 10).rounded() / 10, (seconds * 10).rounded() / 10) }
+    }
+}
+
+
+/// Wav settings for a chunk file in the buffer's own rate and channel count (16-bit PCM)
+func chunkFileSettings(_ format: AVAudioFormat) -> [String: Any] {
+    [
+        AVFormatIDKey: kAudioFormatLinearPCM,
+        AVSampleRateKey: format.sampleRate,
+        AVNumberOfChannelsKey: format.channelCount,
+        AVLinearPCMBitDepthKey: 16,
+        AVLinearPCMIsFloatKey: false,
+        AVLinearPCMIsBigEndianKey: false,
+    ]
+}
+
+/// One side of a meeting (the mic = "mic", the Mac's sound = "system"): short WAV chunks for Whisper, and on
+/// request a snapshot of the chunk still being spoken (main transcribes it for the live, greyed words).
+/// feed() runs on an audio thread; the rest on the main queue.
+final class MeetingTrack {
+    let source: String
+    private var chunker: Chunker!
+    private let dir: String
+
+    init(source: String, dir: String, format: AVAudioFormat, session: @escaping () -> Bool) {
+        self.source = source
+        self.dir = dir
+        chunker = Chunker(dir: dir, settings: chunkFileSettings(format), format: format, prefix: source + "-") { [weak self] path, start, seconds in
+            guard let self, session() else { return }
+            emit(["type": "chunk", "path": path, "start": start, "seconds": seconds, "source": self.source])
+        }
+    }
+
+    func feed(_ buffer: AVAudioPCMBuffer) { chunker.write(buffer) }
+
+    func preview() {
+        let path = (dir as NSString).appendingPathComponent("preview-\(source).wav")
+        if let p = chunker.preview(to: path) {
+            emit(["type": "preview", "source": source, "path": path, "index": p.index, "start": (p.start * 10).rounded() / 10, "seconds": (p.seconds * 10).rounded() / 10])
+        } else {
+            emit(["type": "preview", "source": source, "none": true])
+        }
+    }
+
+    func close() { chunker.close() }
+}
+
+/// The Mac's sound output (the other people on a call) through a Core Audio process tap (macOS 14.2+). The tap
+/// leaves out this helper's own sounds. macOS asks once for permission to capture audio from other apps.
+@available(macOS 14.2, *)
+final class SystemAudioTap {
+    private var tapID = AudioObjectID(kAudioObjectUnknown)
+    private var aggID = AudioObjectID(kAudioObjectUnknown)
+    private var procID: AudioDeviceIOProcID?
+    private let queue = DispatchQueue(label: "royflow.systemtap", qos: .userInitiated)
+    private(set) var format: AVAudioFormat?
+
+    private static func get<T>(_ obj: AudioObjectID, _ sel: AudioObjectPropertySelector, _ value: inout T, qualifier: UnsafeRawPointer? = nil, qualifierSize: UInt32 = 0) -> OSStatus {
+        var a = AudioObjectPropertyAddress(mSelector: sel, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        var size = UInt32(MemoryLayout<T>.size)
+        return AudioObjectGetPropertyData(obj, &a, qualifierSize, qualifier, &size, &value)
+    }
+
+    /// set up the tap; `prepare` is called once with the tap's format (on the caller's thread, before any audio)
+    /// and returns the handler that gets copies of the captured audio on a background queue
+    func start(prepare: (AVAudioFormat) -> (AVAudioPCMBuffer) -> Void) -> String? {
+        var output = AudioObjectID(kAudioObjectUnknown)
+        guard Self.get(AudioObjectID(kAudioObjectSystemObject), kAudioHardwarePropertyDefaultSystemOutputDevice, &output) == noErr else { return "no output device" }
+        var uidRef: Unmanaged<CFString>?
+        guard Self.get(output, kAudioDevicePropertyDeviceUID, &uidRef) == noErr, let outputUID = uidRef?.takeRetainedValue() as String? else { return "no output device UID" }
+        var me = AudioObjectID(kAudioObjectUnknown)
+        var pid = getpid()
+        _ = Self.get(AudioObjectID(kAudioObjectSystemObject), kAudioHardwarePropertyTranslatePIDToProcessObject, &me, qualifier: &pid, qualifierSize: UInt32(MemoryLayout<pid_t>.size))
+        let desc = CATapDescription(stereoGlobalTapButExcludeProcesses: me == kAudioObjectUnknown ? [] : [me])
+        desc.uuid = UUID()
+        desc.name = "Roy Flow meeting audio"
+        desc.isPrivate = true
+        desc.muteBehavior = .unmuted
+        var err = AudioHardwareCreateProcessTap(desc, &tapID)
+        guard err == noErr else { return "process tap failed (\(err))" }
+        var asbd = AudioStreamBasicDescription()
+        err = Self.get(tapID, kAudioTapPropertyFormat, &asbd)
+        guard err == noErr, let fmt = AVAudioFormat(streamDescription: &asbd) else { stop(); return "tap format unavailable (\(err))" }
+        format = fmt
+        let onBuffer = prepare(fmt)
+        let agg: [String: Any] = [
+            kAudioAggregateDeviceNameKey: "Roy Flow meeting tap",
+            kAudioAggregateDeviceUIDKey: UUID().uuidString,
+            kAudioAggregateDeviceMainSubDeviceKey: outputUID,
+            kAudioAggregateDeviceIsPrivateKey: true,
+            kAudioAggregateDeviceIsStackedKey: false,
+            kAudioAggregateDeviceTapAutoStartKey: true,
+            kAudioAggregateDeviceSubDeviceListKey: [[kAudioSubDeviceUIDKey: outputUID]],
+            kAudioAggregateDeviceTapListKey: [[kAudioSubTapDriftCompensationKey: true, kAudioSubTapUIDKey: desc.uuid.uuidString]],
+        ]
+        err = AudioHardwareCreateAggregateDevice(agg as CFDictionary, &aggID)
+        guard err == noErr else { stop(); return "aggregate device failed (\(err))" }
+        err = AudioDeviceCreateIOProcIDWithBlock(&procID, aggID, queue) { _, input, _, _, _ in
+            guard let src = AVAudioPCMBuffer(pcmFormat: fmt, bufferListNoCopy: input, deallocator: nil), src.frameLength > 0,
+                  let dst = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: src.frameLength) else { return }
+            dst.frameLength = src.frameLength
+            let s = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: input))
+            let d = UnsafeMutableAudioBufferListPointer(dst.mutableAudioBufferList)
+            for i in 0..<min(s.count, d.count) {
+                if let sp = s[i].mData, let dp = d[i].mData { memcpy(dp, sp, Int(min(s[i].mDataByteSize, d[i].mDataByteSize))) }
+            }
+            onBuffer(dst)
+        }
+        guard err == noErr else { stop(); return "audio callback failed (\(err))" }
+        err = AudioDeviceStart(aggID, procID)
+        guard err == noErr else { stop(); return "could not start (\(err))" }
+        return nil
+    }
+
+    func stop() {
+        if aggID != kAudioObjectUnknown {
+            if let procID {
+                AudioDeviceStop(aggID, procID)
+                AudioDeviceDestroyIOProcID(aggID, procID)
+            }
+            AudioHardwareDestroyAggregateDevice(aggID)
+        }
+        if tapID != kAudioObjectUnknown { AudioHardwareDestroyProcessTap(tapID) }
+        procID = nil
+        aggID = AudioObjectID(kAudioObjectUnknown)
+        tapID = AudioObjectID(kAudioObjectUnknown)
+        queue.sync {} // the last callback has finished
     }
 }
 
@@ -268,8 +431,12 @@ final class Dictation {
     private var segmentText = ""
     private var rotateTimer: Timer?
     private var pendingSegments = 0
-    private var chunker: Chunker?
+    private var micTrack: MeetingTrack?
+    private var systemTrack: MeetingTrack?
+    private var systemTap: AnyObject?
     private var chunkDir: String?
+    private var captureSystem = false
+    private var meetingLocale = "en-US"
     // fast stop (dictation mode)
     private var stopRequested = Date()
     private var audioEndedAt = Date()
@@ -280,9 +447,11 @@ final class Dictation {
 
     var busy: Bool { !finished }
 
-    func start(locale: String, device: String?, mode: String, record: String?, engine: String = "apple", chunks: String? = nil) {
+    func start(locale: String, device: String?, mode: String, record: String?, engine: String = "apple", chunks: String? = nil, system: Bool = false) {
         guard finished else { return emitError("busy", mode == "meeting" ? "Something is already recording" : "A recording is already running") }
         chunkDir = mode == "meeting" && engine == "whisper" && !(chunks ?? "").isEmpty ? chunks : nil
+        captureSystem = chunkDir != nil && system
+        meetingLocale = locale
         recordOnly = engine == "whisper" && (mode == "meeting" ? chunkDir != nil : !(record ?? "").isEmpty)
         finished = false
         stopping = false
@@ -430,27 +599,16 @@ final class Dictation {
                 return emitError("audio", "Could not create the recording file")
             }
         }
-        chunker = nil
+        micTrack = nil
         if let dir = chunkDir {
-            let settings: [String: Any] = [
-                AVFormatIDKey: kAudioFormatLinearPCM,
-                AVSampleRateKey: format.sampleRate,
-                AVNumberOfChannelsKey: format.channelCount,
-                AVLinearPCMBitDepthKey: 16,
-                AVLinearPCMIsFloatKey: false,
-                AVLinearPCMIsBigEndianKey: false,
-            ]
-            chunker = Chunker(dir: dir, settings: settings, format: format) { [weak self] path, start, seconds in
-                guard let self, id == self.session else { return }
-                emit(["type": "chunk", "path": path, "start": start, "seconds": seconds])
-            }
+            micTrack = MeetingTrack(source: "mic", dir: dir, format: format) { [weak self] in self?.session == id }
         }
-        let chunker = self.chunker
+        let micTrack = self.micTrack
         input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
             guard let self else { return }
             self.request?.append(buffer)
             if let f = self.file { try? f.write(from: buffer) }
-            chunker?.write(buffer)
+            micTrack?.feed(buffer)
             self.level(buffer)
         }
         engine.prepare()
@@ -463,6 +621,7 @@ final class Dictation {
         }
         self.engine = engine
         self.request = req
+        if captureSystem, let dir = chunkDir { startSystemAudio(dir: dir, session: id) }
         startedAt = Date()
         if recordOnly {
             task = nil
@@ -546,6 +705,29 @@ final class Dictation {
         emit(["type": "level", "value": (Double(v) * 100).rounded() / 100])
     }
 
+    /// the other side of a call: the Mac's sound output, as its own track
+    private func startSystemAudio(dir: String, session id: Int) {
+        guard #available(macOS 14.2, *) else { return emit(["type": "system", "ok": false, "error": "needs macOS 14.2"]) }
+        let tap = SystemAudioTap()
+        let err = tap.start { format in
+            let track = MeetingTrack(source: "system", dir: dir, format: format) { [weak self] in self?.session == id }
+            systemTrack = track
+            return { buffer in track.feed(buffer) }
+        }
+        if let err {
+            systemTrack = nil
+            emit(["type": "system", "ok": false, "error": err])
+            return
+        }
+        systemTap = tap
+        emit(["type": "system", "ok": true])
+    }
+
+    /// a snapshot of the sentence still being spoken on one side, for the live words
+    func preview(_ source: String) {
+        (source == "system" ? systemTrack : micTrack)?.preview() ?? emit(["type": "preview", "source": source, "none": true])
+    }
+
     private func stopAudio() {
         rotateTimer?.invalidate()
         rotateTimer = nil
@@ -556,8 +738,12 @@ final class Dictation {
         }
         engine = nil
         file = nil // closes and finalises the WAV header
-        chunker?.close() // the tap is gone: report the last chunk
-        chunker = nil
+        micTrack?.close() // the tap is gone: report the last chunk
+        micTrack = nil
+        if #available(macOS 14.2, *), let tap = systemTap as? SystemAudioTap { tap.stop() }
+        systemTap = nil
+        systemTrack?.close()
+        systemTrack = nil
     }
 
     func stop() {
@@ -610,7 +796,6 @@ final class Dictation {
         guard !finished else { return emit(["type": "cancelled"]) }
         finished = true
         session += 1
-        chunker = nil
         stopAudio()
         task?.cancel()
         task = nil
@@ -1306,7 +1491,8 @@ func handle(_ line: String) {
     }
     switch cmd {
     case "start":
-        dictation.start(locale: obj["locale"] as? String ?? "en-US", device: obj["device"] as? String, mode: obj["mode"] as? String ?? "dictation", record: obj["record"] as? String, engine: obj["engine"] as? String ?? "apple", chunks: obj["chunks"] as? String)
+        dictation.start(locale: obj["locale"] as? String ?? "en-US", device: obj["device"] as? String, mode: obj["mode"] as? String ?? "dictation", record: obj["record"] as? String, engine: obj["engine"] as? String ?? "apple", chunks: obj["chunks"] as? String, system: obj["system"] as? Bool ?? false)
+    case "preview": dictation.preview(obj["source"] as? String ?? "mic")
     case "warm": dictation.prewarm(locale: obj["locale"] as? String ?? "en-US", device: obj["device"] as? String)
     case "stop": dictation.stop()
     case "cancel": dictation.cancel()

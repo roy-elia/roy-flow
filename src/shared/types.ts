@@ -63,6 +63,10 @@ export interface TranscriptSegment {
   tr?: string;
   /** wall-clock time the words were spoken (ms) */
   at?: number;
+  /** seconds of audio this line covers */
+  d?: number;
+  /** "them": heard from the Mac's sound (the other side of a call); otherwise the mic ("You") */
+  who?: 'them';
 }
 export interface SummaryBullet {
   text: string;

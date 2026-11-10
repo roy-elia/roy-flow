@@ -14,9 +14,10 @@ import { buildAppMenu, buildTrayMenu, type MenuContext, type MenuSnapshot } from
 import * as ai from './ai';
 import { audioDir, audioPath, getData, hasData, loadData, patchData, pruneAudio, saveNow, wipeAll } from './data';
 import { rmSync } from 'node:fs';
-import { migrateModels, WhisperServer } from './whisper';
+import { LIVE_MODEL, migrateModels, WhisperServer } from './whisper';
 import { addUsage, budgetState, budgetUsd, currentMonth, featureOn, FEATURE_LABEL, modelFor, usd, type AiFeature, type UsageMonth } from '../src/shared/aiUsage';
 import { toWhisperWav } from './wav';
+import { addSegment } from '../src/shared/echo';
 import { correctionPairs, glossaryPrompt, LEARN_CHECK_AFTER_MS } from '../src/shared/learn';
 import { addToClaude, mcpInfo, startMcpServer, stopMcpServer } from './mcpServer';
 import { applyDictionary, applySnippets, changedWords, cleanUp, styleText, wordCount } from '../src/shared/textPipeline';
@@ -536,6 +537,8 @@ function armCap() {
 
 /* ------------------------------------------------------------------ speech engine (Whisper default, Apple Speech) */
 let whisper!: WhisperServer;
+/** second, small Whisper for Notetaker's live words, so previews never wait behind final chunks */
+let liveWhisper: WhisperServer | null = null;
 let dictEngine: 'whisper' | 'apple' = 'apple';
 /** why this dictation fell back to Apple Speech (shown after it is pasted) */
 let engineNote: string | undefined;
@@ -552,6 +555,7 @@ function initWhisper() {
   // the move failed (other volume?): use them where they are rather than downloading 1.7 GB again
   if (!readdirSafe(dir).some((n) => n.endsWith('.bin')) && readdirSafe(OLD_MODELS_DIR()).some((n) => n.endsWith('.bin'))) dir = OLD_MODELS_DIR();
   whisper = new WhisperServer({ bin: WHISPER_BIN, modelsDir: dir, stateFile: userFile('whisper-state.json'), log });
+  liveWhisper = new WhisperServer({ bin: WHISPER_BIN, modelsDir: dir, stateFile: userFile('whisper-live-state.json'), model: LIVE_MODEL, log: (...a: unknown[]) => log('[live]', ...a) });
   let prev: WhisperStatus['server'] = 'stopped';
   whisper.on('status', (st: WhisperStatus) => {
     broadcast('whisper:status', st);
@@ -1108,6 +1112,16 @@ interface MeetingRun {
   offset: number;
   resumed: boolean;
   stage: 'recording' | 'finishing';
+  /** live words of the chunk still being spoken, per side (Whisper previews), and which chunk they belong to */
+  live: { mic: string; system: string };
+  liveIdx: { mic: number; system: number };
+  previewTimer?: NodeJS.Timeout;
+  previewBusy?: boolean;
+  previewTurn?: number;
+  previewAt?: number;
+  /** chunks waiting for Whisper, with the words Apple heard in them */
+  waiting: { file: string; who: 'you' | 'them'; text: string; t: number; index?: number }[];
+  systemAudio?: 'on' | 'off' | 'error';
 }
 let meeting: MeetingRun | null = null;
 /** a stopped meeting whose last chunks are still being transcribed */
@@ -1134,6 +1148,12 @@ function meetingStatus(): MeetingStatus {
         thoughts: m.thoughts,
         engine: m.engine,
         offset: m.offset,
+        systemAudio: m.systemAudio,
+        interim: [
+          ...m.waiting.map((w) => ({ who: w.who, text: w.text, t: w.t })),
+          ...(m.live.mic.trim() ? [{ who: 'you' as const, text: m.live.mic, t: m.offset + (Date.now() - m.startedAt) / 1000 }] : []),
+          ...(m.live.system.trim() ? [{ who: 'them' as const, text: m.live.system, t: m.offset + (Date.now() - m.startedAt) / 1000 }] : []),
+        ],
       }
     : { recording: false, startedAt: 0, title: '', partial: '', segments: [] };
 }
@@ -1230,17 +1250,27 @@ async function startMeeting(title?: string, resumeId?: string): Promise<{ ok: bo
     offset,
     resumed: !!prev,
     stage: 'recording',
+    live: { mic: '', system: '' },
+    liveIdx: { mic: -1, system: -1 },
+    waiting: [],
   };
   session = 'meeting';
+  if (engine === 'whisper' && !setting('meetingSystemAudio', true)) meeting.systemAudio = 'off';
   const mic = setting('microphone', DEFAULT_MIC);
   helper.send({
     cmd: 'start',
     mode: 'meeting',
     locale: LANGUAGE_LOCALES[setting('language', 'English')] ?? 'en-US',
     device: mic === DEFAULT_MIC ? '' : mic,
-    ...(engine === 'whisper' ? { engine: 'whisper', chunks: meeting.chunkDir } : {}),
+    ...(engine === 'whisper' ? { engine: 'whisper', chunks: meeting.chunkDir, system: setting('meetingSystemAudio', true) } : {}),
   });
-  if (engine === 'whisper') void whisper.start().catch(() => {}); // load (or compile) the model while people talk
+  if (engine === 'whisper') {
+    void whisper.start().catch(() => {}); // load (or compile) the model while people talk
+    if (liveWhisper?.hasModel()) void liveWhisper.start().catch(() => {});
+    else if (liveWhisper && !liveWhisper.status().download) void liveWhisper.downloadModel({ coreml: false }).catch((e) => log('[live] download failed', String(e)));
+    const run = meeting;
+    run.previewTimer = setInterval(() => requestPreview(run), 300);
+  }
   const maxMin = MAX_LEN[setting('maxRecording', '2 hours')] ?? 120;
   meeting.timers.push(
     setInterval(() => {
@@ -1266,21 +1296,32 @@ async function startMeeting(title?: string, resumeId?: string): Promise<{ ok: bo
   return { ok: true };
 }
 
-/** a chunk the helper closed: transcribe it after the ones before it */
-function onMeetingChunk(file: string, start: number) {
+/** a chunk the helper closed: transcribe it after the ones before it. "heard" is what Apple's recognizer showed
+    live for it; it stays on screen (greyed) until Whisper's text replaces it. */
+function onMeetingChunk(file: string, start: number, source: string, seconds: number) {
   const m = meeting ?? finishing;
   if (!m || m.engine !== 'whisper' || !m.chunkDir || !file.startsWith(m.chunkDir)) return void rmSync(file, { force: true });
+  const who: 'you' | 'them' = source === 'system' ? 'them' : 'you';
+  const side = who === 'them' ? 'system' : 'mic';
+  const index = Number(/(\d+)\.wav$/.exec(file)?.[1] ?? -1);
+  // the live words shown for this chunk stay (greyed) until Whisper's final text replaces them
+  const heard = m.liveIdx[side] === index ? m.live[side] : '';
+  m.waiting.push({ file, who, text: heard, t: m.offset + start, index } as MeetingRun['waiting'][number]);
+  m.live[side] = '';
   m.pending++;
   pushMeetingStatus();
   m.queue = m.queue.then(async () => {
     try {
-      const { wav, seconds } = toWhisperWav(new Uint8Array(readFileSync(file)));
+      const { wav, seconds: audioSec } = toWhisperWav(new Uint8Array(readFileSync(file)));
       const t0 = Date.now();
       const r = await whisper.transcribeDetailed(wav, { language: 'auto', prompt: glossaryPrompt(D().dictionary ?? []), timeoutMs: 20 * 60_000 });
-      log('[meeting] chunk', { audioSeconds: Math.round(seconds * 10) / 10, ms: Date.now() - t0, chars: r.text.length, language: r.language });
+      if (MEETING_TRACE) appendFileSync(MEETING_TRACE, JSON.stringify({ ms: Date.now(), type: 'whisper', source, start, text: r.text, language: r.language }) + '\n');
+      log('[meeting] chunk', { source, audioSeconds: Math.round(audioSec * 10) / 10, ms: Date.now() - t0, chars: r.text.length, language: r.language });
       if (r.text) {
-        const seg: TranscriptSegment = { t: Math.round((m.offset + start) * 10) / 10, text: r.text, at: m.startedAt + start * 1000 };
-        m.segments.push(seg);
+        const seg: TranscriptSegment = { t: Math.round((m.offset + start) * 10) / 10, d: Math.round((seconds || audioSec) * 10) / 10, text: r.text, at: m.startedAt + start * 1000, ...(who === 'them' ? { who } : {}) };
+        const before = m.segments.length;
+        m.segments = addSegment(m.segments, seg);
+        if (m.segments.length <= before) log('[meeting] dropped an echo', { source, chars: r.text.length });
         if (r.language && r.text.length >= 12) {
           m.langVotes[r.language] = (m.langVotes[r.language] ?? 0) + r.text.length;
           m.language = Object.entries(m.langVotes).sort((a, b) => b[1] - a[1])[0][0];
@@ -1292,10 +1333,53 @@ function onMeetingChunk(file: string, start: number) {
       m.error = `A part of the recording could not be transcribed: ${(e as Error).message ?? e}`;
     } finally {
       rmSync(file, { force: true });
+      m.waiting = m.waiting.filter((w) => w.file !== file);
       m.pending--;
       pushMeetingStatus();
     }
   });
+}
+
+/* ---- live words: while Whisper has nothing queued, transcribe the sentence still being spoken (about every
+   2 s, taking turns between your mic and the call). Final chunks always go first. */
+function requestPreview(m: MeetingRun) {
+  if (m.previewBusy && Date.now() - (m.previewAt ?? 0) > 30_000) m.previewBusy = false; // never stuck on a lost reply
+  const fast = !!liveWhisper?.running;
+  // with the small model, previews run beside the final chunks; without it they wait their turn on the big one
+  if (meeting !== m || m.previewBusy || (!fast && (m.pending > 0 || !whisper.running))) return;
+  const sides: ('mic' | 'system')[] = m.systemAudio === 'on' ? ['mic', 'system'] : ['mic'];
+  m.previewTurn = ((m.previewTurn ?? -1) + 1) % sides.length;
+  m.previewBusy = true;
+  m.previewAt = Date.now();
+  helper.send({ cmd: 'preview', source: sides[m.previewTurn] });
+}
+async function onMeetingPreview(msg: HelperMessage) {
+  const m = meeting;
+  if (!m) return;
+  const side = msg.source === 'system' ? 'system' : 'mic';
+  if (msg.none || typeof msg.path !== 'string') {
+    m.previewBusy = false;
+    return;
+  }
+  const index = Number(msg.index);
+  try {
+    const { wav } = toWhisperWav(new Uint8Array(readFileSync(msg.path)));
+    const t0 = Date.now();
+    const fast = liveWhisper?.running ? liveWhisper : null;
+    const r = await (fast ?? whisper).transcribeDetailed(wav, { language: 'auto', prompt: glossaryPrompt(D().dictionary ?? []), timeoutMs: 30_000 });
+    if (MEETING_TRACE) appendFileSync(MEETING_TRACE, JSON.stringify({ ms: Date.now(), type: 'preview', source: side, index, seconds: msg.seconds, text: r.text, model: fast ? 'live' : 'main', whisperMs: Date.now() - t0 }) + '\n');
+    const w = m.waiting.find((x) => x.index === index && x.who === (side === 'system' ? 'them' : 'you'));
+    if (w) w.text = r.text || w.text; // the chunk closed while this was being transcribed
+    else if (r.text) {
+      m.live[side] = r.text;
+      m.liveIdx[side] = index;
+    }
+    pushMeetingStatus();
+  } catch (e) {
+    log('[meeting] preview failed', String(e));
+  } finally {
+    m.previewBusy = false;
+  }
 }
 
 /** fill in .tr (English) for segments that have none; Claude, in batches */
@@ -1326,6 +1410,9 @@ async function stopMeeting(reason?: string) {
   const m = meeting;
   if (!m) return;
   m.timers.forEach((t) => clearInterval(t));
+  clearInterval(m.previewTimer);
+  liveWhisper?.stop(); // free its memory until the next meeting
+  m.live = { mic: '', system: '' };
   m.stage = 'finishing';
   meeting = null;
   finishing = m;
@@ -1405,12 +1492,18 @@ async function summarize(m: Meeting): Promise<{ ok: boolean; error?: string }> {
 const toggleMeeting = () => (meeting ? void stopMeeting() : void startMeeting().then((r) => !r.ok && notice(r.error ?? 'Could not start Notetaker', 'error')));
 
 /* ------------------------------------------------------------------ helper messages */
+/** test-only: ROYFLOW_MEETING_TRACE=1 writes the arrival time of every live word update and chunk to
+    logs/meeting-trace.ndjson, to measure how quickly words appear */
+const MEETING_TRACE = process.env.ROYFLOW_MEETING_TRACE ? path.join(app.getPath('logs'), 'meeting-trace.ndjson') : null;
 helper.on('message', (m: HelperMessage) => {
-  if (!['level', 'partial', 'keys', 'segment', 'access', 'activated', 'focusedText', 'frontmost'].includes(m.type)) log('[helper]', m.type === 'final' ? { type: 'final', chars: String(m.text ?? '').length, via: m.via, stopMs: m.stopMs } : m);
+  if (MEETING_TRACE && session === 'meeting' && ['chunk', 'system'].includes(m.type))
+    appendFileSync(MEETING_TRACE, JSON.stringify({ ms: Date.now(), type: m.type, source: m.source, text: m.text ?? m.heard, start: m.start, seconds: m.seconds }) + '\n');
+  if (!['level', 'partial', 'keys', 'segment', 'access', 'activated', 'focusedText', 'frontmost', 'chunk', 'preview'].includes(m.type)) log('[helper]', m.type === 'final' ? { type: 'final', chars: String(m.text ?? '').length, via: m.via, stopMs: m.stopMs } : m);
   switch (m.type) {
     case 'partial':
       if (session === 'meeting' && meeting) {
-        meeting.partial = String(m.text ?? '');
+        if (meeting.engine === 'whisper') meeting.live[m.source === 'system' ? 'system' : 'mic'] = String(m.text ?? '');
+        else meeting.partial = String(m.text ?? '');
         pushMeetingStatus();
         break;
       }
@@ -1419,7 +1512,17 @@ helper.on('message', (m: HelperMessage) => {
       if (phase === 'recording') broadcast('dictation:status', { phase, interim, kind: 'dictation' });
       break;
     case 'chunk':
-      onMeetingChunk(String(m.path ?? ''), Number(m.start) || 0);
+      onMeetingChunk(String(m.path ?? ''), Number(m.start) || 0, String(m.source ?? 'mic'), Number(m.seconds) || 0);
+      break;
+    case 'preview':
+      void onMeetingPreview(m);
+      break;
+    case 'system':
+      if (meeting) {
+        meeting.systemAudio = m.ok ? 'on' : 'error';
+        if (!m.ok) log('[meeting] system audio unavailable', m.error);
+        pushMeetingStatus();
+      }
       break;
     case 'segment':
       if (meeting) {
@@ -2234,6 +2337,7 @@ app.on('will-quit', () => {
   saveNow();
   stopMcpServer();
   whisper?.stop();
+  liveWhisper?.stop();
   helper.kill();
 });
 app.on('window-all-closed', () => {
@@ -2273,7 +2377,7 @@ async function runWhisperSelfTest(file: string) {
       const run: MeetingRun = {
         id: 'selftest', startedAt: now, title: 'New note', segments: [], partial: '', lastVoice: now, timers: [], warned: false, engine: 'whisper',
         chunkDir: path.join(app.getPath('temp'), `royflow-meeting-selftest-${now}`), queue: Promise.resolve(), pending: 0, langVotes: {}, translate: false,
-        thoughts: '', offset: 0, resumed: false, stage: 'recording',
+        thoughts: '', offset: 0, resumed: false, stage: 'recording', live: { mic: '', system: '' }, liveIdx: { mic: -1, system: -1 }, waiting: [],
       };
       mkdirSync(run.chunkDir!, { recursive: true });
       finishing = run;
@@ -2281,7 +2385,7 @@ async function runWhisperSelfTest(file: string) {
       [0, 1].forEach((k) => {
         const f = path.join(run.chunkDir!, `0000${k + 1}.wav`);
         copyFileSync(file, f);
-        onMeetingChunk(f, k * 10);
+        onMeetingChunk(f, k * 10, k ? 'system' : 'mic', 5);
       });
       result.meetingPendingAfterQueue = run.pending;
       await run.queue;
