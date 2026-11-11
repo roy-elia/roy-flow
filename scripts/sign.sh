@@ -14,6 +14,10 @@ WHISPER="$APP/Contents/Resources/whisper/whisper-server"
 [ -f "$WHISPER" ] || { echo "missing $WHISPER"; exit 1; }
 codesign --force --sign - --identifier com.royelia.royflow.whisper \
   -r='designated => identifier "com.royelia.royflow.whisper"' "$WHISPER"
+PARAKEET="$APP/Contents/Resources/RoyFlowParakeet"
+[ -f "$PARAKEET" ] || { echo "missing $PARAKEET"; exit 1; }
+codesign --force --sign - --identifier com.royelia.royflow.parakeet \
+  -r='designated => identifier "com.royelia.royflow.parakeet"' "$PARAKEET"
 codesign --force --deep --sign - "$APP"
 # re-sign the outer bundle only (not --deep, nested frameworks keep their own identifiers)
 codesign --force --sign - --identifier com.royelia.royflow -r='designated => identifier "com.royelia.royflow"' "$APP"

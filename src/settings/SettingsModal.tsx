@@ -20,7 +20,7 @@ import { Confirm, Dialog, Dropdown, Switch } from '../components/ui';
 import { useCalendar } from '../native/useCalendar';
 import { toggleTheme } from '../components/Shell';
 import { native } from '../native/bridge';
-import { DEFAULT_MIC, LANGUAGES, SPEECH_ENGINES, UNLOAD_OPTIONS, type AiUsageStatus, type McpInfo, type WhisperStatus } from '../shared/ipc';
+import { DEFAULT_MIC, LANGUAGES, SPEECH_ENGINES, UNLOAD_OPTIONS, type AiUsageStatus, type McpInfo, type ParakeetStatus, type WhisperStatus } from '../shared/ipc';
 import { BUDGETS, FEATURE_LABEL, FEATURE_SWITCHES, MODEL_IDS, MODEL_NAMES, MODEL_SETTINGS, usd, type AiFeature, type ModelName } from '../shared/aiUsage';
 import { demoData } from '../seed';
 import { useShortcutLabel } from './ShortcutsEditor';
@@ -209,12 +209,13 @@ function General() {
             Change
           </button>
         </Row>
-        <Row label="Speech engine" desc="Whisper runs on this Mac with your dictionary as a hint. Apple Speech shows live text while you speak. Notetaker always uses Apple Speech.">
+        <Row label="Speech engine" desc="Parakeet runs on this Mac's Neural Engine and is the fastest (25 European languages; Whisper covers the rest). Whisper also runs on this Mac and uses your dictionary as a hint. Apple Speech shows live text while you speak.">
           <Select k="engine" options={Object.entries(SPEECH_ENGINES).map(([value, label]) => ({ value, label }))} width={220} />
         </Row>
+        {(s.engine ?? 'parakeet') === 'parakeet' && <ParakeetModel />}
         {s.engine !== 'apple' && <WhisperModel />}
         {s.engine !== 'apple' && (
-          <Row label="Memory saver" desc="Unloads the Whisper model when you have not dictated for a while. It reloads in about 2 s when you start dictating.">
+          <Row label="Memory saver" desc="Unloads the Whisper model when you have not dictated for a while. It reloads in about 2 s when you start dictating. Parakeet stays loaded (it uses very little memory).">
             <Select k="unloadModel" options={Object.keys(UNLOAD_OPTIONS)} width={165} />
           </Row>
         )}
@@ -239,6 +240,47 @@ function General() {
 }
 
 const mb = (n: number) => (n >= 1e9 ? `${(n / 1e9).toFixed(1)} GB` : `${Math.round(n / 1e6)} MB`);
+
+/** Parakeet model status and download (632 MB) */
+function ParakeetModel() {
+  const [st, setSt] = useState<ParakeetStatus | null>(null);
+  useEffect(() => {
+    if (!native) return;
+    void native.invoke('parakeet:status').then(setSt);
+    return native.on('parakeet:status', (x) => setSt((p) => ({ ...p, ...x })));
+  }, []);
+  if (!native) return <Row label="Parakeet model" desc="Available in the Roy Flow desktop app." />;
+  if (!st) return null;
+  const download = async () => {
+    const r = await native!.invoke('parakeet:download');
+    toast(r.ok ? 'Parakeet model downloaded' : (r.error ?? 'Download failed'), r.ok ? {} : { tone: 'error' });
+  };
+  const text: Record<ParakeetStatus['state'], ReactNode> = {
+    missing: 'Not downloaded (632 MB). Until it is, Whisper is used.',
+    downloading: (
+      <>
+        Downloading Parakeet Ultra… {Math.round((st.progress ?? 0) * 100)}%
+        <div className="progress" style={{ margin: '6px 0 0', width: 260 }}>
+          <div style={{ width: `${Math.max(3, Math.round((st.progress ?? 0) * 100))}%` }} />
+        </div>
+      </>
+    ),
+    stopped: 'Parakeet Ultra · not loaded yet',
+    loading: 'Parakeet Ultra · loading (up to a minute the first time)…',
+    ready: 'Parakeet Ultra · loaded',
+    error: `Parakeet Ultra · could not start${st.error ? `: ${st.error}` : ''}; Whisper is used`,
+  };
+  const desc = st.binary === false ? 'The Parakeet engine is missing from this build, so Whisper is used.' : text[st.state];
+  return (
+    <Row label="Parakeet model" desc={desc}>
+      {st.binary !== false && (st.state === 'missing' || st.state === 'downloading') && (
+        <button className="btn btn-secondary set-btn" disabled={st.state === 'downloading'} onClick={download}>
+          {st.state === 'downloading' ? 'Downloading…' : 'Download'}
+        </button>
+      )}
+    </Row>
+  );
+}
 
 /** Whisper model status, download with progress, and what happens while it is missing */
 function WhisperModel() {

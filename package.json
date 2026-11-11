@@ -57,6 +57,10 @@
         "to": "RoyFlowHelper"
       },
       {
+        "from": "native/build/RoyFlowParakeet",
+        "to": "RoyFlowParakeet"
+      },
+      {
         "from": "vendor/whisper/whisper-server",
         "to": "whisper/whisper-server"
       },

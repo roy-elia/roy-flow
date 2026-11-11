@@ -52,7 +52,7 @@ export function defaultSettings(): Record<string, string | boolean> {
       autoCleanup: 'Medium',
       aiCleanup: false,
       migrated13: true,
-      engine: 'whisper',
+      engine: 'parakeet',
       unloadModel: 'After 15 min',
       autoLearn: true,
       focusMode: false,

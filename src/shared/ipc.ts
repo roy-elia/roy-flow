@@ -133,7 +133,14 @@ export interface WhisperStatus {
   modelsDir: string;
 }
 
-export const SPEECH_ENGINES = { whisper: 'Whisper (on this Mac)', apple: 'Apple Speech' } as const;
+export const SPEECH_ENGINES = { parakeet: 'Parakeet (fast, on this Mac)', whisper: 'Whisper (on this Mac)', apple: 'Apple Speech' } as const;
+/** the Parakeet engine (Settings › General › Speech engine) */
+export interface ParakeetStatus {
+  state: 'missing' | 'stopped' | 'loading' | 'downloading' | 'ready' | 'error';
+  progress?: number;
+  error?: string;
+  binary?: boolean;
+}
 export type SpeechEngine = keyof typeof SPEECH_ENGINES;
 /** memory saver: unload the Whisper model after this long without a dictation */
 export const UNLOAD_OPTIONS: Record<string, number> = { 'After 5 min': 5, 'After 15 min': 15, 'After 60 min': 60, 'Keep loaded': 0 };
@@ -195,6 +202,8 @@ export interface InvokeChannels {
   'notify:test': { args: void; result: void };
   'whisper:status': { args: void; result: WhisperStatus };
   'whisper:download': { args: void; result: { ok: boolean; error?: string } };
+  'parakeet:status': { args: void; result: ParakeetStatus };
+  'parakeet:download': { args: void; result: { ok: boolean; error?: string } };
   /** names of the apps in /Applications, /System/Applications and ~/Applications (Focus Mode picker) */
   'apps:installed': { args: void; result: string[] };
 }
@@ -220,6 +229,7 @@ export interface EventChannels {
   'ai:done': { id: string; error?: string };
   toast: { text: string; tone?: 'success' | 'error' };
   'whisper:status': WhisperStatus;
+  'parakeet:status': ParakeetStatus;
   'ai:usage': AiUsageStatus;
 }
 
@@ -228,11 +238,11 @@ export const INVOKE_CHANNELS: (keyof InvokeChannels)[] = [
   'store:load', 'store:export', 'store:reset', 'access:check', 'access:open', 'hotkeys:apply', 'devices:get', 'app:info',
   'ai:status', 'ai:setKey', 'ai:clearKey', 'ai:test', 'ai:usage', 'ai:cleanup', 'ai:transform', 'ai:ask', 'ai:voice',
   'meeting:summarize', 'meeting:start', 'meeting:stop', 'meeting:translate', 'meeting:catchup', 'meeting:thoughts', 'meeting:live', 'meeting:open', 'audio:get', 'audio:extract', 'calendar:get', 'mcp:info', 'mcp:addClaude', 'notify:test',
-  'whisper:status', 'whisper:download', 'apps:installed',
+  'whisper:status', 'whisper:download', 'parakeet:status', 'parakeet:download', 'apps:installed',
 ];
 export const EVENT_CHANNELS: (keyof EventChannels)[] = [
   'nav', 'dictation:status', 'dictation:level', 'dictation:result', 'store:changed', 'store:mutate', 'flowbar:config', 'flowbar:changes', 'flowbar:mic',
-  'flowbar:note', 'access:changed', 'hotkeys:keys', 'meeting:status', 'calendar:changed', 'ai:chunk', 'ai:done', 'toast', 'whisper:status', 'ai:usage',
+  'flowbar:note', 'access:changed', 'hotkeys:keys', 'meeting:status', 'calendar:changed', 'ai:chunk', 'ai:done', 'toast', 'whisper:status', 'parakeet:status', 'ai:usage',
 ];
 
 export interface RoyFlowBridge {

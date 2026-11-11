@@ -14,7 +14,8 @@ import { buildAppMenu, buildTrayMenu, type MenuContext, type MenuSnapshot } from
 import * as ai from './ai';
 import { audioDir, audioPath, getData, hasData, loadData, patchData, pruneAudio, saveNow, wipeAll } from './data';
 import { rmSync } from 'node:fs';
-import { LIVE_MODEL, migrateModels, WhisperServer } from './whisper';
+import { migrateModels, WhisperServer } from './whisper';
+import { Parakeet, PARAKEET_LANGS } from './parakeet';
 import { addUsage, budgetState, budgetUsd, currentMonth, featureOn, FEATURE_LABEL, modelFor, usd, type AiFeature, type UsageMonth } from '../src/shared/aiUsage';
 import { toWhisperWav } from './wav';
 import { addSegment } from '../src/shared/echo';
@@ -53,6 +54,7 @@ const RES = app.isPackaged ? process.resourcesPath : APP_ROOT;
 const HELPER_BIN = app.isPackaged ? path.join(process.resourcesPath, 'RoyFlowHelper') : path.join(APP_ROOT, 'native/build/RoyFlowHelper');
 const TRAY_ICON = app.isPackaged ? path.join(RES, 'tray/trayTemplate.png') : path.join(APP_ROOT, 'resources/trayTemplate.png');
 const SOUNDS = app.isPackaged ? path.join(RES, 'sounds') : path.join(APP_ROOT, 'resources/sounds');
+const PARAKEET_BIN = app.isPackaged ? path.join(process.resourcesPath, 'RoyFlowParakeet') : path.join(APP_ROOT, 'native/build/RoyFlowParakeet');
 const WHISPER_BIN = app.isPackaged ? path.join(RES, 'whisper/whisper-server') : path.join(APP_ROOT, 'vendor/whisper/whisper-server');
 /** test-only: `ROYFLOW_SELFTEST_WAV=x.wav "Roy Flow.app/Contents/MacOS/Roy Flow"` runs the WAV through the Whisper
     engine path, logs the transcript and quits (does not touch the running app or its data) */
@@ -491,7 +493,8 @@ async function startDictation(how: 'toggle' | 'ptt') {
   // prewarm: (re)load the model while the user speaks (memory saver may have unloaded it)
   if (dictEngine === 'whisper') {
     clearTimeout(unloadTimer);
-    void whisper.start().catch(() => {});
+    if (useParakeet() && parakeet.running) void parakeet.start().catch(() => {});
+    else void whisper.start().catch(() => {});
   }
   // Whisper needs the audio even when history audio is off: a temporary file, deleted once transcribed
   let record = '';
@@ -537,8 +540,12 @@ function armCap() {
 
 /* ------------------------------------------------------------------ speech engine (Whisper default, Apple Speech) */
 let whisper!: WhisperServer;
-/** second, small Whisper for Notetaker's live words, so previews never wait behind final chunks */
-let liveWhisper: WhisperServer | null = null;
+/** NVIDIA Parakeet on the Neural Engine: the default engine for dictation and Notetaker (25 European languages) */
+let parakeet!: Parakeet;
+/** the chosen speech engine: parakeet (default), whisper or apple */
+const engineSetting = () => setting('engine', 'parakeet');
+/** Parakeet is chosen, downloaded and speaks this language (otherwise Whisper takes over) */
+const useParakeet = (lang = whisperLanguage()) => engineSetting() === 'parakeet' && !!parakeet?.usable && PARAKEET_LANGS.has(lang);
 let dictEngine: 'whisper' | 'apple' = 'apple';
 /** why this dictation fell back to Apple Speech (shown after it is pasted) */
 let engineNote: string | undefined;
@@ -555,7 +562,8 @@ function initWhisper() {
   // the move failed (other volume?): use them where they are rather than downloading 1.7 GB again
   if (!readdirSafe(dir).some((n) => n.endsWith('.bin')) && readdirSafe(OLD_MODELS_DIR()).some((n) => n.endsWith('.bin'))) dir = OLD_MODELS_DIR();
   whisper = new WhisperServer({ bin: WHISPER_BIN, modelsDir: dir, stateFile: userFile('whisper-state.json'), log });
-  liveWhisper = new WhisperServer({ bin: WHISPER_BIN, modelsDir: dir, stateFile: userFile('whisper-live-state.json'), model: LIVE_MODEL, log: (...a: unknown[]) => log('[live]', ...a) });
+  parakeet = new Parakeet(PARAKEET_BIN, dir, log);
+  parakeet.on('status', (st) => broadcast('parakeet:status', st));
   let prev: WhisperStatus['server'] = 'stopped';
   whisper.on('status', (st: WhisperStatus) => {
     broadcast('whisper:status', st);
@@ -577,7 +585,11 @@ function readdirSafe(dir: string): string[] {
 
 /** the engine for the next dictation: Whisper when chosen and ready to load, else Apple Speech (with the reason) */
 function pickEngine(): { engine: 'whisper' | 'apple'; note?: string } {
-  if (setting('engine', 'whisper') !== 'whisper') return { engine: 'apple' };
+  if (engineSetting() === 'apple') return { engine: 'apple' };
+  if (useParakeet()) {
+    if (parakeet.running) return { engine: 'whisper' }; // records a WAV like Whisper; speechToText picks Parakeet
+    void parakeet.start().catch(() => {}); // loading after launch (up to ~40 s): Whisper or Apple Speech meanwhile
+  }
   const st = whisper.status();
   if (!st.binary) return { engine: 'apple', note: 'Whisper is missing from this build, so Apple Speech was used.' };
   if (st.model === 'downloading') return { engine: 'apple', note: 'The Whisper model is still downloading, so Apple Speech was used.' };
@@ -609,6 +621,12 @@ const whisperLanguage = () => (LANGUAGE_LOCALES[setting('language', 'English')] 
 async function speechToText(fin: Final): Promise<Final> {
   if (fin.engine !== 'whisper') return fin;
   if (!fin.audio || !existsSync(fin.audio)) return { ...fin, text: '' };
+  if (useParakeet() && (parakeet.running || SELFTEST_WAV)) {
+    const t0 = Date.now();
+    const { text } = await parakeet.transcribeFile(fin.audio, { urgent: true, timeoutMs: 60_000 });
+    log('[parakeet] transcribed', { ms: Date.now() - t0, chars: text.length });
+    return { ...fin, text, via: 'parakeet' };
+  }
   if (!whisper.running && !SELFTEST_WAV) setPhase('processing', { kind: 'dictation', detail: whisper.preparing ? 'Preparing speech model…' : 'Loading speech model…' });
   const { wav, seconds } = toWhisperWav(new Uint8Array(readFileSync(fin.audio)));
   if (seconds < 0.3) return { ...fin, text: '' };
@@ -633,9 +651,10 @@ function armUnload() {
   const min = UNLOAD_OPTIONS[setting('unloadModel', 'After 15 min')] ?? 15;
   if (!min) return;
   unloadTimer = setTimeout(() => {
+    // Parakeet stays loaded: it uses about 13 MB, and a cold load can take 40 s
     if (!whisper.loaded) return;
-    // never kill the one-time compile, an active dictation or a pending Undo
-    if (whisper.preparing || phase !== 'idle' || cancelled) return armUnload();
+    // never kill the one-time compile, an active dictation, a meeting or a pending Undo
+    if (whisper.preparing || phase !== 'idle' || cancelled || meeting || finishing) return armUnload();
     log('[whisper] idle, unloading model', { min });
     whisper.stop();
   }, min * 60_000);
@@ -643,12 +662,18 @@ function armUnload() {
 
 /** start/stop the model to match the engine setting */
 function applyEngine() {
-  if (setting('engine', 'whisper') === 'whisper' && whisper.usable) {
+  if (useParakeet()) {
+    whisper.stop();
+    void parakeet.start().catch(() => {});
+    armUnload();
+  } else if (engineSetting() !== 'apple' && whisper.usable) {
+    parakeet.stop();
     void whisper.start().catch(() => {});
     armUnload();
   } else {
     clearTimeout(unloadTimer);
     whisper.stop();
+    parakeet.stop();
   }
 }
 
@@ -1116,6 +1141,8 @@ interface MeetingRun {
   live: { mic: string; system: string };
   liveIdx: { mic: number; system: number };
   previewTimer?: NodeJS.Timeout;
+  /** which local engine transcribes this meeting's chunks */
+  stt?: 'parakeet' | 'whisper';
   previewBusy?: boolean;
   previewTurn?: number;
   previewAt?: number;
@@ -1210,7 +1237,8 @@ function closeLive() {
 /** the engine for a meeting: Whisper whenever it is chosen and its files are there (chunks wait while the
     model loads or compiles, so nothing is lost), else Apple Speech */
 function meetingEngine(): 'whisper' | 'apple' {
-  if (setting('engine', 'whisper') !== 'whisper') return 'apple';
+  if (engineSetting() === 'apple') return 'apple';
+  if (engineSetting() === 'parakeet' && parakeet.usable) return 'whisper'; // records chunks; transcribed by Parakeet
   const st = whisper.status();
   return st.binary && st.model === 'ready' ? 'whisper' : 'apple';
 }
@@ -1265,9 +1293,10 @@ async function startMeeting(title?: string, resumeId?: string): Promise<{ ok: bo
     ...(engine === 'whisper' ? { engine: 'whisper', chunks: meeting.chunkDir, system: setting('meetingSystemAudio', true) } : {}),
   });
   if (engine === 'whisper') {
-    void whisper.start().catch(() => {}); // load (or compile) the model while people talk
-    if (liveWhisper?.hasModel()) void liveWhisper.start().catch(() => {});
-    else if (liveWhisper && !liveWhisper.status().download) void liveWhisper.downloadModel({ coreml: false }).catch((e) => log('[live] download failed', String(e)));
+    // load the model while people talk; meetings detect the language, so Parakeet is used whenever it is chosen
+    meeting.stt = engineSetting() === 'parakeet' && parakeet.usable ? 'parakeet' : 'whisper';
+    if (meeting.stt === 'parakeet') void parakeet.start().catch(() => {});
+    else void whisper.start().catch(() => {});
     const run = meeting;
     run.previewTimer = setInterval(() => requestPreview(run), 300);
   }
@@ -1314,7 +1343,10 @@ function onMeetingChunk(file: string, start: number, source: string, seconds: nu
     try {
       const { wav, seconds: audioSec } = toWhisperWav(new Uint8Array(readFileSync(file)));
       const t0 = Date.now();
-      const r = await whisper.transcribeDetailed(wav, { language: 'auto', prompt: glossaryPrompt(D().dictionary ?? []), timeoutMs: 20 * 60_000 });
+      const r =
+        m.stt === 'parakeet'
+          ? await parakeet.transcribeFile(file, { urgent: true, timeoutMs: 5 * 60_000 })
+          : await whisper.transcribeDetailed(wav, { language: 'auto', prompt: glossaryPrompt(D().dictionary ?? []), timeoutMs: 20 * 60_000 });
       if (MEETING_TRACE) appendFileSync(MEETING_TRACE, JSON.stringify({ ms: Date.now(), type: 'whisper', source, start, text: r.text, language: r.language }) + '\n');
       log('[meeting] chunk', { source, audioSeconds: Math.round(audioSec * 10) / 10, ms: Date.now() - t0, chars: r.text.length, language: r.language });
       if (r.text) {
@@ -1344,8 +1376,8 @@ function onMeetingChunk(file: string, start: number, source: string, seconds: nu
    2 s, taking turns between your mic and the call). Final chunks always go first. */
 function requestPreview(m: MeetingRun) {
   if (m.previewBusy && Date.now() - (m.previewAt ?? 0) > 30_000) m.previewBusy = false; // never stuck on a lost reply
-  const fast = !!liveWhisper?.running;
-  // with the small model, previews run beside the final chunks; without it they wait their turn on the big one
+  const fast = m.stt === 'parakeet' && parakeet.running;
+  // Parakeet is fast enough to run previews beside the final chunks; Whisper makes them wait their turn
   if (meeting !== m || m.previewBusy || (!fast && (m.pending > 0 || !whisper.running))) return;
   const sides: ('mic' | 'system')[] = m.systemAudio === 'on' ? ['mic', 'system'] : ['mic'];
   m.previewTurn = ((m.previewTurn ?? -1) + 1) % sides.length;
@@ -1365,9 +1397,11 @@ async function onMeetingPreview(msg: HelperMessage) {
   try {
     const { wav } = toWhisperWav(new Uint8Array(readFileSync(msg.path)));
     const t0 = Date.now();
-    const fast = liveWhisper?.running ? liveWhisper : null;
-    const r = await (fast ?? whisper).transcribeDetailed(wav, { language: 'auto', prompt: glossaryPrompt(D().dictionary ?? []), timeoutMs: 30_000 });
-    if (MEETING_TRACE) appendFileSync(MEETING_TRACE, JSON.stringify({ ms: Date.now(), type: 'preview', source: side, index, seconds: msg.seconds, text: r.text, model: fast ? 'live' : 'main', whisperMs: Date.now() - t0 }) + '\n');
+    const fast = m.stt === 'parakeet' && parakeet.running;
+    const r = fast
+      ? await parakeet.transcribeFile(msg.path, { timeoutMs: 30_000 })
+      : await whisper.transcribeDetailed(wav, { language: 'auto', prompt: glossaryPrompt(D().dictionary ?? []), timeoutMs: 30_000 });
+    if (MEETING_TRACE) appendFileSync(MEETING_TRACE, JSON.stringify({ ms: Date.now(), type: 'preview', source: side, index, seconds: msg.seconds, text: r.text, model: fast ? 'parakeet' : 'whisper', whisperMs: Date.now() - t0 }) + '\n');
     const w = m.waiting.find((x) => x.index === index && x.who === (side === 'system' ? 'them' : 'you'));
     if (w) w.text = r.text || w.text; // the chunk closed while this was being transcribed
     else if (r.text) {
@@ -1411,7 +1445,7 @@ async function stopMeeting(reason?: string) {
   if (!m) return;
   m.timers.forEach((t) => clearInterval(t));
   clearInterval(m.previewTimer);
-  liveWhisper?.stop(); // free its memory until the next meeting
+  armUnload(); // the memory saver unloads the model later, as after a dictation
   m.live = { mic: '', system: '' };
   m.stage = 'finishing';
   meeting = null;
@@ -2269,6 +2303,15 @@ function wireIpc() {
   ipcMain.handle('mcp:info', () => mcpInfo());
   ipcMain.handle('mcp:addClaude', () => addToClaude(hub));
   ipcMain.handle('whisper:status', () => whisper.status());
+  ipcMain.handle('parakeet:status', () => ({ ...parakeet.status(), binary: parakeet.hasBinary() }));
+  ipcMain.handle('parakeet:download', async () => {
+    try {
+      await parakeet.start(true);
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: (e as Error).message };
+    }
+  });
   ipcMain.handle('whisper:download', async () => {
     try {
       await whisper.downloadModel();
@@ -2337,7 +2380,7 @@ app.on('will-quit', () => {
   saveNow();
   stopMcpServer();
   whisper?.stop();
-  liveWhisper?.stop();
+  parakeet?.stop();
   helper.kill();
 });
 app.on('window-all-closed', () => {
@@ -2355,7 +2398,9 @@ async function runWhisperSelfTest(file: string) {
     result.compiledBefore = whisper.compiledBefore();
     log('[selftest] whisper', result.status, { compiledBefore: result.compiledBefore });
     const t0 = Date.now();
-    await whisper.start();
+    result.engine = useParakeet() ? 'parakeet' : 'whisper';
+    if (useParakeet()) await parakeet.start();
+    else await whisper.start();
     result.startMs = Date.now() - t0;
     const t1 = Date.now();
     // the same path a dictation takes: helper WAV -> 16 kHz mono -> whisper-server -> dictionary + rule clean-up
@@ -2429,6 +2474,8 @@ app.whenReady().then(async () => {
   if (process.argv.includes('--latency-test')) return void runLatencyTest();
   if (!isDev) serveDist();
   initWhisper();
+  // one time: Whisper users move to Parakeet (much faster on the Neural Engine; Whisper stays the fallback)
+  if (!setting('engineParakeet', false)) mainPatch({ settings: { ...(D().settings ?? {}), engineParakeet: true, ...(setting('engine', 'parakeet') === 'whisper' ? { engine: 'parakeet' } : {}) } });
   wireIpc();
   createTray();
   createBar();

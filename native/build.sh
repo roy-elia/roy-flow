@@ -9,3 +9,8 @@ swiftc -O -target arm64-apple-macos13 \
   -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker Info.plist
 codesign --force --sign - --identifier com.royelia.royflow.helper -r='designated => identifier "com.royelia.royflow.helper"' build/RoyFlowHelper
 echo "built native/build/RoyFlowHelper"
+# Parakeet speech engine (SwiftPM, depends on FluidAudio); the first build takes several minutes
+(cd parakeet && swift build -c release --product RoyFlowParakeet 2>&1 | tail -1)
+cp parakeet/.build/release/RoyFlowParakeet build/RoyFlowParakeet
+codesign --force --sign - --identifier com.royelia.royflow.parakeet -r='designated => identifier "com.royelia.royflow.parakeet"' build/RoyFlowParakeet
+echo "built native/build/RoyFlowParakeet"
