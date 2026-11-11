@@ -12,6 +12,7 @@ if pgrep -f "$DEST/Contents/MacOS/Roy Flow" >/dev/null 2>&1; then
   osascript -e 'tell application id "com.royelia.royflow" to quit' >/dev/null 2>&1 || true
   sleep 2
   pkill -f "$DEST/Contents/MacOS/Roy Flow" 2>/dev/null || true
+  for _ in 1 2 3 4 5 6 7 8 9 10; do pgrep -f "$DEST/Contents/MacOS/Roy Flow" >/dev/null 2>&1 || break; sleep 0.5; done
 fi
 rm -rf "$DEST"
 ditto "$SRC" "$DEST"

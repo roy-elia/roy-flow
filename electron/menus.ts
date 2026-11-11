@@ -32,6 +32,8 @@ export interface MenuContext {
   showTimings(): void;
   setSetting(key: string, value: string | boolean): void;
   quit(): void;
+  /** close Roy Flow's windows; the capsule and shortcuts keep running */
+  closeWindows(): void;
 }
 
 const truncate = (s: string, n: number) => (s.length > n ? s.slice(0, n) + '...' : s);
@@ -108,7 +110,7 @@ export function buildTrayMenu(c: MenuContext): Menu {
     { type: 'separator' },
     { label: 'Help and feedback…', click: () => c.openHub({ modal: 'help' }) },
     { type: 'separator' },
-    { label: 'Quit Roy Flow', accelerator: 'Command+Q', click: c.quit },
+    { label: 'Quit Roy Flow', click: c.quit },
   ];
   return Menu.buildFromTemplate(t);
 }
@@ -128,7 +130,7 @@ export function buildAppMenu(c: MenuContext): Menu {
         { role: 'hideOthers' },
         { role: 'unhide' },
         { type: 'separator' },
-        { label: 'Quit Roy Flow', accelerator: 'Command+Q', click: c.quit },
+        { label: 'Quit Roy Flow', accelerator: 'Command+Q', click: c.closeWindows },
       ],
     },
     {

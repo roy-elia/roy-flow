@@ -3,7 +3,7 @@
    hidden title bar with native traffic lights at 16,15) and a transparent, frameless, always-on-top,
    click-through "status" panel that hosts the Flow Bar; plus a Scratchpad window.
    Dictation, global hotkeys (CGEventTap), paste/copy, mute, sounds and calendar run in the native helper. */
-import { app, BrowserWindow, clipboard, ClipboardItem, dialog, globalShortcut, ipcMain, Menu, nativeImage, net, Notification, protocol, screen, session as electronSession, shell, Tray, type Rectangle, type WebContents } from 'electron';
+import { app, BrowserWindow, powerMonitor, clipboard, ClipboardItem, dialog, globalShortcut, ipcMain, Menu, nativeImage, net, Notification, protocol, screen, session as electronSession, shell, Tray, type Rectangle, type WebContents } from 'electron';
 import { execFileSync } from 'node:child_process';
 import { appendFileSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
@@ -69,7 +69,7 @@ app.setName('Roy Flow');
 protocol.registerSchemesAsPrivileged([{ scheme: 'app', privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true } }]);
 
 if (!SELFTEST_WAV && !app.requestSingleInstanceLock()) {
-  app.quit();
+  app.exit(0); // another copy is running (quit requests are turned into "close windows" below)
 }
 
 /* ------------------------------------------------------------------ log file (~/Library/Logs/Roy Flow/main.log) */
@@ -416,6 +416,8 @@ function createBar() {
     title: 'Flow Bar',
     webPreferences: { ...webPreferences, spellcheck: false, backgroundThrottling: false },
   });
+  // keep the capsule out of Mission Control and App Exposé, where it showed up as a "Roy Flow" window
+  bar.setHiddenInMissionControl(true);
   bar.setAlwaysOnTop(true, 'screen-saver');
   bar.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true, skipTransformProcessType: true });
   bar.setIgnoreMouseEvents(true, { forward: true });
@@ -2211,6 +2213,7 @@ const menuContext = (): MenuContext => ({
     quitting = true;
     app.quit();
   },
+  closeWindows,
 });
 
 let menuTimer: NodeJS.Timeout | undefined;
@@ -2611,7 +2614,19 @@ function runLatencyTest() {
 /* ------------------------------------------------------------------ lifecycle */
 app.on('second-instance', () => showHub());
 app.on('activate', () => showHub());
-app.on('before-quit', () => {
+/** Cmd+Q and the Dock's Quit close the windows only; like Wispr Flow, the capsule and shortcuts keep running.
+    A real quit comes from the menu-bar icon (Quit Roy Flow), a relaunch, or logout/shutdown. */
+function closeWindows() {
+  for (const w of [hub, scratch, live]) if (w && !w.isDestroyed()) w.close();
+  applyDockPolicy();
+}
+app.on('before-quit', (e) => {
+  if (!quitting) {
+    e.preventDefault();
+    log('[app] quit request: closing windows, the capsule keeps running');
+    closeWindows();
+    return;
+  }
   quitting = true;
 });
 /* ------------------------------------------------------------------ resource metrics (Help › Log Resource Usage, or `kill -USR2 <pid>`) */
@@ -2795,6 +2810,16 @@ async function runFeatureSelfTest(out: string) {
 }
 
 app.whenReady().then(async () => {
+  // logout, restart and shutdown must really quit
+  powerMonitor.on('shutdown', () => {
+    quitting = true;
+  });
+  // `kill`, Activity Monitor's Quit and the installer also really quit
+  for (const sig of ['SIGTERM', 'SIGINT'] as const)
+    process.on(sig, () => {
+      quitting = true;
+      app.quit();
+    });
   loadData();
   installAiControls();
   if (SELFTEST_WAV) return void runWhisperSelfTest(SELFTEST_WAV);
