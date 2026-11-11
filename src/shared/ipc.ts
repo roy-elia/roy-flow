@@ -3,7 +3,7 @@ import type { UsageMonth } from './aiUsage';
    Type-only plus the channel allow-lists, so it can be bundled into main, preload and the web build. */
 import type { ChatMessage, HistoryItem, Meeting, TranscriptSegment, VoiceProfile } from './types';
 
-export type DockEdge = 'bottom' | 'left' | 'right';
+export type DockEdge = 'bottom' | 'top' | 'left' | 'right';
 export type DictationPhase = 'idle' | 'starting' | 'recording' | 'processing' | 'error';
 
 export interface DictationStatus {
@@ -15,6 +15,8 @@ export interface DictationStatus {
   label?: string;
   /** a line under the pill while processing a dictation (e.g. "Loading speech model…") */
   detail?: string;
+  /** hands-free (toggle) dictation shows Cancel/Finish buttons; hold-to-talk shows only the waveform */
+  handsFree?: boolean;
 }
 
 export interface DictationResult {
@@ -165,6 +167,8 @@ export interface SendChannels {
   'flowbar:action': string;
   /** the Flow Bar has more than the pill to show (notes, live text, tips, diff): grow the panel window */
   'flowbar:expand': boolean;
+  'flowbar:menu': void;
+  'flowbar:drag': 'start' | 'end';
 }
 
 /** renderer -> main (request/response) */
@@ -193,6 +197,7 @@ export interface InvokeChannels {
   'meeting:thoughts': { args: { text?: string; title?: string }; result: void };
   'meeting:live': { args: { show: boolean }; result: void };
   'meeting:open': { args: { id: string }; result: void };
+  'meeting:import': { args: void; result: { ok: boolean; id?: string; error?: string } };
   'meeting:stop': { args: void; result: void };
   'audio:get': { args: { file: string }; result: Uint8Array | null };
   'audio:extract': { args: { file: string; name: string }; result: { ok: boolean; path?: string } };
@@ -233,11 +238,11 @@ export interface EventChannels {
   'ai:usage': AiUsageStatus;
 }
 
-export const SEND_CHANNELS: (keyof SendChannels)[] = ['store:patch', 'dictation:toggle', 'dictation:cancel', 'flowbar:interactive', 'flowbar:ready', 'hub:open', 'hotkeys:record', 'scratchpad:open', 'scratchpad:close', 'meeting:toggle', 'flowbar:action', 'flowbar:expand'];
+export const SEND_CHANNELS: (keyof SendChannels)[] = ['store:patch', 'dictation:toggle', 'dictation:cancel', 'flowbar:interactive', 'flowbar:ready', 'hub:open', 'hotkeys:record', 'scratchpad:open', 'scratchpad:close', 'meeting:toggle', 'flowbar:action', 'flowbar:expand', 'flowbar:menu', 'flowbar:drag'];
 export const INVOKE_CHANNELS: (keyof InvokeChannels)[] = [
   'store:load', 'store:export', 'store:reset', 'access:check', 'access:open', 'hotkeys:apply', 'devices:get', 'app:info',
   'ai:status', 'ai:setKey', 'ai:clearKey', 'ai:test', 'ai:usage', 'ai:cleanup', 'ai:transform', 'ai:ask', 'ai:voice',
-  'meeting:summarize', 'meeting:start', 'meeting:stop', 'meeting:translate', 'meeting:catchup', 'meeting:thoughts', 'meeting:live', 'meeting:open', 'audio:get', 'audio:extract', 'calendar:get', 'mcp:info', 'mcp:addClaude', 'notify:test',
+  'meeting:summarize', 'meeting:start', 'meeting:stop', 'meeting:translate', 'meeting:catchup', 'meeting:thoughts', 'meeting:live', 'meeting:open', 'meeting:import', 'audio:get', 'audio:extract', 'calendar:get', 'mcp:info', 'mcp:addClaude', 'notify:test',
   'whisper:status', 'whisper:download', 'parakeet:status', 'parakeet:download', 'apps:installed',
 ];
 export const EVENT_CHANNELS: (keyof EventChannels)[] = [

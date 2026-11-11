@@ -35,4 +35,29 @@ const sounds = {
   notify: render([[0, 783.99, 0.25, 0.22], [0.09, 1046.5, 0.25, 0.2], [0.18, 1318.5, 0.4, 0.18]], 0.62),
 };
 for (const [name, s] of Object.entries(sounds)) writeFileSync(`resources/sounds/${name}.wav`, wav(s));
-console.log('wrote resources/sounds/{start,stop,cancel,notify}.wav');
+// more sound styles (Settings › Sound), like Wispr's choice of sound sets: each in resources/sounds/<style>/
+const styles = {
+  soft: {
+    start: render([[0, 440, 0.3, 0.16], [0.09, 554.37, 0.4, 0.14]], 0.55),
+    stop: render([[0, 554.37, 0.3, 0.14], [0.09, 440, 0.42, 0.15]], 0.58),
+    cancel: render([[0, 329.63, 0.3, 0.13]], 0.36),
+    notify: render([[0, 523.25, 0.35, 0.14], [0.12, 659.25, 0.45, 0.12]], 0.65),
+  },
+  click: {
+    start: render([[0, 1760, 0.035, 0.3]], 0.06),
+    stop: render([[0, 1318.5, 0.035, 0.3]], 0.06),
+    cancel: render([[0, 880, 0.04, 0.26], [0.05, 880, 0.04, 0.2]], 0.12),
+    notify: render([[0, 1567.98, 0.05, 0.26], [0.07, 2093, 0.06, 0.22]], 0.16),
+  },
+  chime: {
+    start: render([[0, 1046.5, 0.5, 0.18], [0.05, 1567.98, 0.6, 0.12]], 0.75),
+    stop: render([[0, 1567.98, 0.5, 0.14], [0.05, 1046.5, 0.6, 0.16]], 0.75),
+    cancel: render([[0, 698.46, 0.4, 0.15]], 0.5),
+    notify: render([[0, 1318.5, 0.5, 0.15], [0.1, 1760, 0.6, 0.13], [0.2, 2093, 0.7, 0.1]], 0.95),
+  },
+};
+for (const [style, set] of Object.entries(styles)) {
+  mkdirSync(`resources/sounds/${style}`, { recursive: true });
+  for (const [name, s] of Object.entries(set)) writeFileSync(`resources/sounds/${style}/${name}.wav`, wav(s));
+}
+console.log('wrote resources/sounds/{start,stop,cancel,notify}.wav and the soft, click and chime styles');

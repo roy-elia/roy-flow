@@ -25,7 +25,8 @@ html.flowbar-window {
   line-height: 20px;
   color: #fff;
 }
-.flowbar-window button {
+/* zero specificity, so component classes (.fb-disc, .fb-round) keep their backgrounds and borders */
+:where(.flowbar-window) :where(button) {
   font: inherit;
   color: inherit;
   background: none;
@@ -66,6 +67,13 @@ html.flowbar-window body {
 }
 .flowbar-window .fb-live {
   max-width: 420px;
+}
+
+/* top dock: the bottom dock mirrored (notes and tooltips open below the pill) */
+.flowbar-host.dock-top {
+  top: 6px;
+  bottom: auto;
+  flex-direction: column-reverse;
 }
 
 /* side docks: a 90-degree rotation of the bottom dock (UI_FLOWBAR.md §9) */
@@ -114,7 +122,12 @@ html.flowbar-window body {
 .dock-left .fb-pill.recording,
 .dock-right .fb-pill.recording {
   width: 30px;
-  height: 103px;
+  height: 73px;
+}
+.dock-left .fb-pill.recording.handsfree,
+.dock-right .fb-pill.recording.handsfree {
+  width: 30px;
+  height: 102.5px;
   padding: 6px 0;
 }
 .dock-left .fb-pill.processing,
@@ -125,15 +138,27 @@ html.flowbar-window body {
 }
 .dock-left .fb-wave,
 .dock-right .fb-wave {
+  /* side docks: the same waveform, standing up (bars grow sideways) */
   flex-direction: column;
   height: auto;
-  width: 20px;
+  width: 18px;
+  padding: 4px 8px;
 }
 .dock-left .fb-wave span,
 .dock-right .fb-wave span {
-  height: 3px;
-  min-width: 3px;
-  transition: width 0.08s linear;
+  transform: scaleX(calc(var(--audio-scale) * var(--bar-height-scale)));
+}
+.dock-left .fb-wave.live span,
+.dock-right .fb-wave.live span {
+  animation-name: fb-wave-x;
+}
+@keyframes fb-wave-x {
+  0% { transform: scaleX(calc(var(--audio-scale) * var(--bar-height-scale) * 1)); }
+  20% { transform: scaleX(calc(var(--audio-scale) * var(--bar-height-scale) * 1.2)); }
+  40% { transform: scaleX(calc(var(--audio-scale) * var(--bar-height-scale) * 1.5)); }
+  80% { transform: scaleX(calc(var(--audio-scale) * var(--bar-height-scale) * 1.1)); }
+  90% { transform: scaleX(calc(var(--audio-scale) * var(--bar-height-scale) * 1.3)); }
+  100% { transform: scaleX(calc(var(--audio-scale) * var(--bar-height-scale) * 1)); }
 }
 .dock-left .fb-pickers,
 .dock-right .fb-pickers {

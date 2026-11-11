@@ -57,3 +57,23 @@ describe('Parakeet engine client', () => {
     expect(PARAKEET_LANGS.has('ja')).toBe(false);
   });
 });
+
+describe('Parakeet load watchdog', () => {
+  it('restarts an engine that never answers', async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'pk-'));
+    // first run hangs (never says ready); the second run answers
+    const flag = path.join(dir, 'flag');
+    const bin = path.join(dir, 'fake');
+    writeFileSync(bin, `#!/usr/bin/env node
+const fs = require('fs');
+const hang = !fs.existsSync(${JSON.stringify(flag)});
+fs.writeFileSync(${JSON.stringify(flag)}, '1');
+require('readline').createInterface({ input: process.stdin }).on('line', () => { if (!hang) process.stdout.write(JSON.stringify({ type: 'ready', ms: 1 }) + '\\n'); });
+`);
+    chmodSync(bin, 0o755);
+    for (const n of ['Encoder.mlmodelc', 'Decoder.mlmodelc', 'JointDecisionv3.mlmodelc']) mkdirSync(path.join(dir, 'm', PARAKEET_DIR, n), { recursive: true });
+    p = new Parakeet(bin, path.join(dir, 'm'), () => {}, 1500);
+    await p.start();
+    expect(p.running).toBe(true);
+  });
+});

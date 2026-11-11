@@ -80,9 +80,12 @@ const HESITATIONS = /(?<![\p{L}'])(?:u+m+|u+h+m*|e+r+m+|e+r+|a+h+|h+m+|m+h*m+)(?
 /** discourse fillers, only when set off by commas (so "do you know him" and "I like it" survive) */
 const COMMA_FILLERS = /(^|[,.!?]\s*|\s)(?:you know|i mean|like|basically|so yeah)\s*,\s*/giu;
 const TRAILING_FILLERS = /,?\s+(?:you know|i guess|or something)\s*([.!?]?)\s*$/iu;
-/** "the the", "I I": a repeated word is a stutter (kept: words that legitimately repeat) */
-const STUTTER = /(?<![\p{L}\p{N}])([\p{L}']+)(?:\s+\1)+(?![\p{L}\p{N}])/giu;
-const KEEP_REPEATS = new Set(['that', 'had', 'is', 'very', 'really', 'no', 'bye', 'so', 'ha', 'go']);
+/** "the the", "I I": a short function word said twice in a row is a stutter. Anything else ("hello hello hello",
+    "very very", "go go go") is said on purpose and kept, like Wispr. */
+const STUTTER = /(?<![\p{L}\p{N}])([\p{L}']+)(?:[ \t]+\1)+(?![\p{L}\p{N}])/giu;
+const STUTTER_WORDS = new Set(
+  "i a an the to of and or but in on at for with it we you he she they my our your his her their this is are was be i'm it's we're".split(' '),
+);
 /** "new line" / "new paragraph" said while dictating */
 const SPOKEN_BREAKS = /[,.]?\s*\b(new paragraph|new line|next line)\b[,.]?\s*/giu;
 
@@ -99,7 +102,7 @@ export function cleanUp(text: string, level = 'Medium'): string {
   t = t.replace(HESITATIONS, '');
   t = t.replace(COMMA_FILLERS, (_m, lead: string) => (lead.includes(',') ? ' ' : lead));
   t = t.replace(TRAILING_FILLERS, '$1');
-  t = t.replace(STUTTER, (m, w: string) => (KEEP_REPEATS.has(w.toLowerCase()) ? m : w));
+  t = t.replace(STUTTER, (m, w: string) => (STUTTER_WORDS.has(w.toLowerCase()) && m.trim().split(/\s+/).length === 2 ? w : m));
   t = t.replace(SPOKEN_BREAKS, (_m, cmd: string) => (cmd.toLowerCase() === 'new paragraph' ? '\n\n' : '\n'));
   t = t
     .replace(/[ \t]+([,.!?;:])/g, '$1')
@@ -189,4 +192,25 @@ export function correctedWords(before: string, after: string): { word: string; m
     out.push(word.toLowerCase() === mis.toLowerCase() ? { word } : { word, misspelling: mis });
   }
   return out;
+}
+
+/** Wispr: "press enter" (or "press return") at the very end of a dictation presses Return after pasting */
+export function splitPressEnter(raw: string): { text: string; enter: boolean } {
+  const re = /[,.]?\s*\bpress (?:enter|return)[.!]?\s*$/i;
+  return re.test(raw) ? { text: raw.replace(re, '').trim(), enter: true } : { text: raw, enter: false };
+}
+
+/** Wispr's "stacked messages": in chat apps, send each paragraph (or, in one paragraph, each sentence) as its own message */
+export function stackMessages(text: string): string[] {
+  const paras = text.split(/\n\s*\n/).map((p) => p.trim()).filter(Boolean);
+  if (paras.length > 1) return paras;
+  const sentences = text.match(/[^.!?]+[.!?]+(?=\s|$)|[^.!?]+$/g)?.map((x) => x.trim()).filter(Boolean) ?? [];
+  return sentences.length > 1 ? sentences : [text.trim()];
+}
+
+/** transcript retention (Wispr: 1 to 365 days or never): meetings older than this many days, or none */
+export const MEETING_RETENTION: Record<string, number | null> = { Forever: null, '1 day': 1, '7 days': 7, '30 days': 30, '90 days': 90, '365 days': 365 };
+export function expiredMeetings<T extends { ts: number; demo?: boolean }>(list: T[], choice: string, now = Date.now()): T[] {
+  const days = MEETING_RETENTION[choice] ?? null;
+  return days === null ? [] : list.filter((m) => !m.demo && now - m.ts > days * 86_400_000);
 }

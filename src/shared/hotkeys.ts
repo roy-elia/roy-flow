@@ -36,6 +36,8 @@ export function mouseButtonName(button: number): string | null {
 export const BASE_ACTIONS: HotkeyAction[] = [
   { id: 'ptt', label: 'Push to talk', desc: 'Hold to dictate, release to paste', hold: true, modifierOnly: true, required: true },
   { id: 'handsfree', label: 'Hands-free mode', desc: 'Press to start dictating, press again to paste' },
+  { id: 'instruct', label: 'Instruct Mode', desc: 'Hold and say what to write; Claude drafts it using the text on screen. Needs a Claude key', hold: true, modifierOnly: true },
+  { id: 'command', label: 'Command Mode', desc: 'Select text, hold and say what to change (or what to write). Needs a Claude key', hold: true, modifierOnly: true },
   { id: 'cancel', label: 'Cancel', desc: 'Dismiss the current dictation without pasting', when: 'recording', standalone: true, required: true },
   { id: 'pasteLast', label: 'Paste last transcript', desc: 'Paste your most recent dictation again' },
   { id: 'copyLast', label: 'Copy last transcript', desc: 'Copy your most recent dictation to the clipboard' },
@@ -48,6 +50,8 @@ export const BASE_ACTIONS: HotkeyAction[] = [
 export const DEFAULT_HOTKEYS: HotkeyMap = {
   ptt: [['fn']],
   handsfree: [['opt', 'space']],
+  command: [['fn', 'ctrl']],
+  instruct: [['fn', 'shift']],
   cancel: [['esc']],
   pasteLast: [['ctrl', 'cmd', 'v']],
   copyLast: [['ctrl', 'cmd', 'c']],

@@ -65,6 +65,8 @@ export interface TranscriptSegment {
   at?: number;
   /** seconds of audio this line covers */
   d?: number;
+  /** who spoke, by name (imported transcripts) */
+  speaker?: string;
   /** "them": heard from the Mac's sound (the other side of a call); otherwise the mic ("You") */
   who?: 'them';
 }

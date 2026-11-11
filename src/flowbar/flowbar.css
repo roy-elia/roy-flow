@@ -45,9 +45,11 @@
   border: 1px solid #30302f;
   color: #fff;
   overflow: hidden;
-  transition: width 0.2s var(--spring-easing), height 0.2s var(--spring-easing), background 0.1s var(--ease), border-color 0.1s var(--ease);
+  /* Wispr: every change eases over 0.1 s; collapsing back to the resting line takes 0.3 s */
+  transition: all 0.1s cubic-bezier(0.05, 0.6, 0.4, 0.95);
 }
 .fb-pill.resting {
+  transition-duration: 0.3s;
   width: 40px;
   height: 8px;
   border-radius: 6px;
@@ -62,13 +64,17 @@
   border-color: #5b5b59;
 }
 .fb-pill.recording {
-  width: 103px;
-  padding: 0 6px;
+  width: 73px;
+}
+.fb-pill.recording.handsfree {
+  /* Wispr's hands-free pill: the waveform and a round stop button (Esc cancels) */
+  width: 102.5px;
+  padding: 0 6px 0 12px;
   justify-content: space-between;
 }
 .fb-pill.processing {
   width: 98px;
-  padding: 0 12px;
+  padding: 6px 12px;
 }
 .fb-pill.polishing {
   width: 136px;
@@ -94,25 +100,55 @@
   background: #5b5b59;
 }
 .fb-wave {
+  /* Wispr's waveform: 10 bars, 2 px wide and 2 px apart, scaled by the smoothed mic level (--audio-scale) */
+  --audio-scale: 1;
   display: flex;
   align-items: center;
   gap: 2px;
-  height: 20px;
+  height: 18px;
+  padding: 8px 4px;
+  box-sizing: content-box;
 }
 .fb-wave span {
-  width: 3px;
-  min-height: 3px;
-  border-radius: 2px;
-  background: #fff;
-  transition: height 0.08s linear;
+  width: 2px;
+  height: 2px;
+  border-radius: 0.5px;
+  background: hsl(0 0% 100% / 0.4);
+  transform-origin: center;
+  transform: scaleY(calc(var(--audio-scale) * var(--bar-height-scale)));
 }
+.fb-wave.live span {
+  background: #fff;
+  animation: fb-wave 1s ease-in-out infinite;
+}
+@keyframes fb-wave {
+  0% { transform: scaleY(calc(var(--audio-scale) * var(--bar-height-scale) * 1)); }
+  20% { transform: scaleY(calc(var(--audio-scale) * var(--bar-height-scale) * 1.2)); }
+  40% { transform: scaleY(calc(var(--audio-scale) * var(--bar-height-scale) * 1.5)); }
+  80% { transform: scaleY(calc(var(--audio-scale) * var(--bar-height-scale) * 1.1)); }
+  90% { transform: scaleY(calc(var(--audio-scale) * var(--bar-height-scale) * 1.3)); }
+  100% { transform: scaleY(calc(var(--audio-scale) * var(--bar-height-scale) * 1)); }
+}
+/* processing: 8 lavender ticks fading round a 16 px circle, like Wispr */
 .fb-spinner {
-  width: 14px;
-  height: 14px;
-  border-radius: 50%;
-  border: 2px solid rgb(255 255 255 / 0.25);
-  border-top-color: #fff;
-  animation: spin 0.8s linear infinite;
+  position: relative;
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+}
+.fb-spinner i {
+  position: absolute;
+  left: 7px;
+  top: 5.5px;
+  width: 2px;
+  height: 5px;
+  border-radius: 1px;
+  background: rgb(163 148 199 / 0.15);
+  animation: fb-fade 1.1s linear infinite;
+}
+@keyframes fb-fade {
+  0% { background: rgb(163 148 199 / 0.88); }
+  100% { background: rgb(163 148 199 / 0.15); }
 }
 .fb-polish {
   position: relative;

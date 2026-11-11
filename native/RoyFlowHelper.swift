@@ -827,6 +827,20 @@ func postCommandKey(_ key: CGKeyCode) {
     up?.post(tap: .cghidEventTap)
 }
 
+/// a plain key press without modifiers (spoken "press enter")
+func pressKey(_ type: String, _ key: CGKeyCode) {
+    guard accessibilityTrusted(prompt: false) else { return emit(["type": type, "ok": false, "reason": "accessibility"]) }
+    let src = CGEventSource(stateID: .privateState)
+    for down in [true, false] {
+        let e = CGEvent(keyboardEventSource: src, virtualKey: key, keyDown: down)
+        e?.flags = []
+        e?.setIntegerValueField(.eventSourceUserData, value: syntheticMarker)
+        e?.post(tap: .cghidEventTap)
+        if down { usleep(5_000) }
+    }
+    emit(["type": type, "ok": true])
+}
+
 func keystroke(_ type: String, _ key: CGKeyCode) {
     guard accessibilityTrusted(prompt: false) else {
         return emit(["type": type, "ok": false, "reason": "accessibility"])
@@ -1422,6 +1436,43 @@ func frontmost() -> [String: Any] {
 // MARK: - Focused text (auto-learn) and hiding apps (Focus Mode)
 
 /// AXValue of the focused text element, or nil (secure/password fields, non-text elements, very long values)
+/// the readable text of the frontmost window (Instruct Mode's screen context): static text and text areas,
+/// top to bottom, capped; secure fields are never read
+func windowText() -> [String: Any] {
+    var out: [String: Any] = ["type": "windowText", "text": ""]
+    guard let app = NSWorkspace.shared.frontmostApplication else { return out }
+    let ax = AXUIElementCreateApplication(app.processIdentifier)
+    AXUIElementSetMessagingTimeout(ax, 0.3)
+    var win: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(ax, kAXFocusedWindowAttribute as CFString, &win) == .success, let w = win, CFGetTypeID(w) == AXUIElementGetTypeID() else { return out }
+    var parts: [String] = []
+    var total = 0
+    var visited = 0
+    func walk(_ el: AXUIElement, _ depth: Int) {
+        guard depth < 40, visited < 4000, total < 12_000 else { return }
+        visited += 1
+        var role: CFTypeRef?
+        AXUIElementCopyAttributeValue(el, kAXRoleAttribute as CFString, &role)
+        let r = role as? String ?? ""
+        if r == "AXSecureTextField" { return }
+        if ["AXStaticText", "AXTextArea", "AXTextField", "AXHeading"].contains(r) {
+            var value: CFTypeRef?
+            if AXUIElementCopyAttributeValue(el, kAXValueAttribute as CFString, &value) == .success, let v = (value as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !v.isEmpty {
+                parts.append(String(v.prefix(4000)))
+                total += min(v.count, 4000)
+            }
+        }
+        var kids: CFTypeRef?
+        if AXUIElementCopyAttributeValue(el, kAXChildrenAttribute as CFString, &kids) == .success, let list = kids as? [AXUIElement] {
+            for k in list { walk(k, depth + 1) }
+        }
+    }
+    walk(w as! AXUIElement, 0)
+    out["text"] = String(parts.joined(separator: "\n").prefix(12_000))
+    out["app"] = app.localizedName ?? ""
+    return out
+}
+
 func focusedText() -> [String: Any] {
     var out: [String: Any] = ["type": "focusedText", "text": NSNull(), "pid": 0]
     let sys = AXUIElementCreateSystemWide()
@@ -1498,6 +1549,7 @@ func handle(_ line: String) {
     case "cancel": dictation.cancel()
     case "paste": keystroke("pasted", 9)
     case "copy": keystroke("copied", 8)
+    case "enter": pressKey("entered", 36)
     case "access":
         let trusted = accessibilityTrusted(prompt: obj["prompt"] as? Bool ?? false)
         if obj["listen"] as? Bool ?? false, !CGPreflightListenEventAccess() { _ = CGRequestListenEventAccess() }
@@ -1506,6 +1558,7 @@ func handle(_ line: String) {
     case "devices": emit(["type": "devices", "devices": inputDevices().map { $0.name }])
     case "frontmost": emit(frontmost())
     case "focusedText": emit(focusedText())
+    case "windowText": emit(windowText())
     case "hide":
         let pid = pid_t(obj["pid"] as? Int ?? 0)
         emit(["type": "hidden", "pid": Int(pid), "ok": hideApp(pid: pid)])

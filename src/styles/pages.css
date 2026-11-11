@@ -2680,3 +2680,32 @@ mark {
 .tc-bubble.them {
   background: color-mix(in srgb, var(--success) 9%, var(--background-tertiary));
 }
+
+/* Notetaker skills menu (type "/" in Ask) */
+.nn-ask { position: relative; }
+.nn-skills {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: calc(100% + 8px);
+  display: flex;
+  flex-direction: column;
+  padding: 6px;
+  border-radius: 12px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  box-shadow: 0 8px 24px rgb(0 0 0 / 0.12);
+  z-index: 5;
+}
+.nn-skill {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  text-align: left;
+  font-size: 13px;
+}
+.nn-skill:hover { background: var(--muted-hover); }
+.nn-skill span { color: var(--foreground-tertiary); font-size: 12px; }

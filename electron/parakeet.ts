@@ -29,11 +29,15 @@ export class Parakeet extends EventEmitter {
   private waiters = new Map<number, { resolve: (r: SttResult) => void; reject: (e: Error) => void; timer: NodeJS.Timeout }>();
   private nextId = 1;
   private st: ParakeetStatus;
+  /** the engine's last stderr lines (FluidAudio's log), written to our log when a load fails */
+  private stderrTail = '';
 
   constructor(
     readonly bin: string,
     readonly modelsDir: string,
     private readonly log: (...a: unknown[]) => void = () => {},
+    /** how long a load may take before the engine is restarted (tests shorten it) */
+    private readonly loadTimeoutMs = 150_000,
   ) {
     super();
     this.st = { state: this.hasModel() ? 'stopped' : 'missing' };
@@ -73,7 +77,10 @@ export class Parakeet extends EventEmitter {
     if (this.proc) return this.proc;
     const proc = spawn(this.bin, ['--models', this.modelsDir], { stdio: ['pipe', 'pipe', 'pipe'] });
     this.proc = proc;
-    proc.stderr?.on('data', () => {}); // FluidAudio logs here; drain it
+    this.stderrTail = '';
+    proc.stderr?.on('data', (d: Buffer) => {
+      this.stderrTail = (this.stderrTail + d.toString()).slice(-1500);
+    });
     createInterface({ input: proc.stdout! }).on('line', (line) => this.onLine(line));
     proc.once('exit', (code, sig) => {
       if (this.proc !== proc) return;
@@ -106,11 +113,14 @@ export class Parakeet extends EventEmitter {
         this.set({ state: 'ready' });
         this.emit('ready');
         break;
+      case 'warm':
+        this.log('[parakeet] warm', { ms: m.ms });
+        break;
       case 'missing':
         this.set({ state: 'missing' });
         break;
       case 'loadError':
-        this.log('[parakeet] load failed', m.message);
+        this.log('[parakeet] load failed', m.message, this.stderrTail.split('\n').slice(-4).join(' | '));
         this.set({ state: 'error', error: String(m.message) });
         this.emit('loadError', new Error(String(m.message)));
         break;
@@ -127,7 +137,7 @@ export class Parakeet extends EventEmitter {
   }
 
   /** load the model (or download it first with download=true); resolves when it can transcribe */
-  start(download = false): Promise<void> {
+  start(download = false, attempt = 1): Promise<void> {
     if (this.ready) return this.ready;
     if (!this.hasBinary()) return Promise.reject(new Error(`Parakeet engine missing at ${this.bin}`));
     if (!download && !this.hasModel()) return Promise.reject(new Error('The Parakeet model is not downloaded'));
@@ -141,9 +151,31 @@ export class Parakeet extends EventEmitter {
         this.off('ready', done);
         reject(e);
       };
+      // a load normally takes under a minute; one was seen to hang without an error, so restart it once
+      const limit = download ? 60 * 60_000 : this.loadTimeoutMs;
+      let abandoned = false;
+      const timer = setTimeout(() => {
+        abandoned = true;
+        this.log('[parakeet] load timed out', { attempt, stderr: this.stderrTail.split('\n').slice(-4).join(' | ') });
+        this.off('ready', done);
+        this.off('loadError', fail);
+        this.killProc();
+        if (attempt < 2) this.start(download, attempt + 1).then(resolve, reject);
+        else {
+          this.set({ state: 'error', error: 'Loading the model timed out' });
+          reject(new Error('Parakeet timed out while loading'));
+        }
+      }, limit);
+      const clear = () => clearTimeout(timer);
+      this.once('ready', clear);
+      this.once('loadError', clear);
       this.once('ready', done);
       this.once('loadError', fail);
-      proc.once('exit', () => fail(new Error('Parakeet exited while loading')));
+      proc.once('exit', () => {
+        clear();
+        if (!abandoned) fail(new Error('Parakeet exited while loading'));
+      });
+      this.log('[parakeet] loading', { attempt });
       this.set({ state: download && !this.hasModel() ? 'downloading' : 'loading', progress: 0 });
       proc.stdin?.write(JSON.stringify({ cmd: download ? 'download' : 'load' }) + '\n');
     });
@@ -152,6 +184,13 @@ export class Parakeet extends EventEmitter {
       if (this.ready === p) this.ready = null;
     });
     return p;
+  }
+
+  private killProc() {
+    const p = this.proc;
+    this.proc = null;
+    this.ready = null;
+    if (p && p.exitCode === null) p.kill('SIGKILL');
   }
 
   /** transcribe an audio file (any WAV the helper writes); urgent requests (final text) go before live words */
@@ -166,6 +205,11 @@ export class Parakeet extends EventEmitter {
       this.waiters.set(id, { resolve, reject, timer });
       this.proc?.stdin?.write(JSON.stringify({ cmd: 'transcribe', id, path: file, urgent: !!opts.urgent }) + '\n');
     });
+  }
+
+  /** wake the Neural Engine (call on key-down; macOS lets an idle model go cold) */
+  warm() {
+    if (this.running) this.proc?.stdin?.write(JSON.stringify({ cmd: 'warm' }) + '\n');
   }
 
   /** unload (memory saver, quit) */

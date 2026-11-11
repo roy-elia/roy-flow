@@ -428,15 +428,19 @@ function System() {
         <Card>
           <Toggle k="launchAtLogin" label="Launch app at login" desc="Starts in the menu bar when you log in" />
           <Toggle k="showFlowBar" label="Show Flow Bar at all times" desc="When off, the Flow Bar only appears while you dictate" />
-          <Row label="Flow Bar position" desc="Where the Flow Bar docks on screen">
-            <Select k="flowBarDock" options={['Bottom', 'Left', 'Right']} width={165} />
+          <Row label="Flow Bar position" desc="Where the Flow Bar sits on screen. You can also right-click the bar to move it.">
+            <Select k="flowBarDock" options={['Bottom', 'Top', 'Left', 'Right']} width={165} />
           </Row>
           <Toggle k="showInDock" label="Show app in dock" desc="When off, Roy Flow lives in the menu bar while its windows are closed" />
         </Card>
       </Section>
       <Section title="Sound">
         <Card>
-          <Toggle k="sounds" label="Dictation and notification sounds" />
+          <Toggle k="dictationSounds" label="Dictation sounds" desc="A sound when dictation starts and stops (off: the bar's animation shows it)" />
+          <Toggle k="sounds" label="Notetaker and notification sounds" />
+          <Row label="Sound style" desc="Plays a sample when you pick one">
+            <Select k="soundStyle" options={['Bell', 'Soft', 'Click', 'Chime']} width={165} />
+          </Row>
           <Toggle k="muteWhileDictating" label="Mute all audio while dictating" desc="Mutes your Mac's output while you speak and restores it afterwards" />
         </Card>
       </Section>
@@ -469,6 +473,8 @@ function System() {
           <Toggle k="autoLearn" label="Learn from my edits" desc="When you fix a name or term right after dictating it into an app, Roy Flow adds the corrected spelling to your dictionary. Password fields are never read." />
           <Toggle k="offerNewMic" label="Offer to switch to a new microphone" desc="When a microphone is plugged in or connects, the Flow Bar offers to use it" />
           <Toggle k="creatorMode" label="Creator mode" desc='Show "Dictating with Roy Flow" on the Flow Bar while you dictate' />
+          <Toggle k="stackedMessages" label="Stacked messages (experimental)" desc="In chat apps, each sentence of a dictation is sent as its own message" />
+          <Toggle k="emailSignature" label="Email signature" desc='Add "Spoken with Roy Flow" under emails you dictate' />
           <Row
             label="Smart Formatting"
             desc={
@@ -571,6 +577,9 @@ function NotetakerSettings() {
       <Section title="Transcript">
         <Card>
           <Toggle k="liveTranscript" label="Show live transcript" desc="See the words appear on the Notetaker page while it records" />
+          <Row label="Keep meeting notes" desc="Older notes and their transcripts are deleted from this Mac">
+            <Select k="meetingRetention" options={['Forever', '1 day', '7 days', '30 days', '90 days', '365 days']} width={165} />
+          </Row>
           <Row label="Transcribe the other side of calls" desc="Also records your Mac's sound (Zoom, Teams, Meet…) and labels it Them, so others are heard even with headphones on. macOS asks once to allow audio capture.">
             <SwitchOn k="meetingSystemAudio" label="Transcribe the other side of calls" />
           </Row>

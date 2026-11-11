@@ -1,5 +1,5 @@
 /* Line-delimited JSON over stdin/stdout.
-   in:  {"cmd":"load"} | {"cmd":"download"} | {"cmd":"transcribe","id":1,"path":"/x.wav","urgent":true}
+   in:  {"cmd":"load"} | {"cmd":"download"} | {"cmd":"warm"} | {"cmd":"transcribe","id":1,"path":"/x.wav","urgent":true}
    out: {"type":"missing"} {"type":"progress","done":0.4} {"type":"ready","ms":900}
         {"type":"result","id":1,"text":"…","language":"english","ms":80} {"type":"error","id":1,"message":"…"} */
 import FluidAudio
@@ -7,6 +7,8 @@ import Foundation
 import NaturalLanguage
 
 setvbuf(stdout, nil, _IOLBF, 0)
+// a dictation waits on us: keep macOS from napping or throttling this background process between requests
+let activity = ProcessInfo.processInfo.beginActivity(options: [.userInitiatedAllowingIdleSystemSleep, .latencyCritical], reason: "Roy Flow speech recognition")
 let outLock = NSLock()
 func emit(_ obj: [String: Any]) {
   guard let d = try? JSONSerialization.data(withJSONObject: obj), let s = String(data: d, encoding: .utf8) else { return }
@@ -66,6 +68,16 @@ actor Engine {
     do { try await t.value } catch { loading = nil; throw error }
   }
 
+  /// a tiny inference so the Neural Engine is awake: macOS lets the model go cold after a few idle minutes,
+  /// which made the first dictation after a break take 1.4 s instead of 0.15 s. Sent on key-down.
+  func warm() async {
+    guard let m = asr else { return }
+    let t0 = Date()
+    var st = TdtDecoderState.make(decoderLayers: await m.decoderLayerCount)
+    _ = try? await m.transcribe([Float](repeating: 0, count: 8_000), decoderState: &st)
+    emit(["type": "warm", "ms": Int(Date().timeIntervalSince(t0) * 1000)])
+  }
+
   func transcribe(_ path: String) async throws -> (String, Double) {
     try await ensureLoaded(download: false)
     guard let m = asr else { throw NSError(domain: "parakeet", code: 2) }
@@ -104,7 +116,7 @@ Task.detached {
     case "transcribe":
       let id = msg["id"] ?? 0
       guard let path = msg["path"] as? String else { continue }
-      Task(priority: (msg["urgent"] as? Bool) == true ? .userInitiated : .utility) {
+      Task(priority: .userInitiated) {
         do {
           let (text, s) = try await engine.transcribe(path)
           emit(["type": "result", "id": id, "text": text, "language": languageName(text) ?? "", "ms": Int(s * 1000)])
@@ -112,6 +124,8 @@ Task.detached {
           emit(["type": "error", "id": id, "message": error.localizedDescription])
         }
       }
+    case "warm":
+      Task { await engine.warm() }
     case "quit":
       exit(0)
     default: break

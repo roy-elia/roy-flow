@@ -76,6 +76,7 @@ export default function Style() {
             />
             <div className="cleanup-cards">
               {[
+                { id: 'None', d: 'Pastes exactly what you said (only dictionary words are fixed).', ex: 'so um I think we should move the launch to friday' },
                 { id: 'Light', d: 'Removes filler words and fixes obvious slips.', ex: 'so I think we should move the launch to friday' },
                 { id: 'Medium', d: 'Adds punctuation, casing and paragraph breaks.', ex: 'So I think we should move the launch to Friday.' },
                 { id: 'High', d: 'Rewrites rambling sentences so they read cleanly.', ex: 'Let’s move the launch to Friday.' },

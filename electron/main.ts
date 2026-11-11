@@ -5,7 +5,7 @@
    Dictation, global hotkeys (CGEventTap), paste/copy, mute, sounds and calendar run in the native helper. */
 import { app, BrowserWindow, clipboard, ClipboardItem, dialog, globalShortcut, ipcMain, Menu, nativeImage, net, Notification, protocol, screen, session as electronSession, shell, Tray, type Rectangle, type WebContents } from 'electron';
 import { execFileSync } from 'node:child_process';
-import { appendFileSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -16,12 +16,13 @@ import { audioDir, audioPath, getData, hasData, loadData, patchData, pruneAudio,
 import { rmSync } from 'node:fs';
 import { migrateModels, WhisperServer } from './whisper';
 import { Parakeet, PARAKEET_LANGS } from './parakeet';
+import { parseTranscript } from '../src/shared/importTranscript';
 import { addUsage, budgetState, budgetUsd, currentMonth, featureOn, FEATURE_LABEL, modelFor, usd, type AiFeature, type UsageMonth } from '../src/shared/aiUsage';
 import { toWhisperWav } from './wav';
 import { addSegment } from '../src/shared/echo';
 import { correctionPairs, glossaryPrompt, LEARN_CHECK_AFTER_MS } from '../src/shared/learn';
 import { addToClaude, mcpInfo, startMcpServer, stopMcpServer } from './mcpServer';
-import { applyDictionary, applySnippets, changedWords, cleanUp, styleText, wordCount } from '../src/shared/textPipeline';
+import { expiredMeetings, splitPressEnter, stackMessages, applyDictionary, applySnippets, changedWords, cleanUp, styleText, wordCount } from '../src/shared/textPipeline';
 import { allActions, bindingsOf, chordLabel, defaultHotkeyMap, helperBindings, toAccelerator, type HotkeyMap } from '../src/shared/hotkeys';
 import { categoryFor, styleKeyFor, type HistoryItem, type Meeting, type State, type Transform, type TranscriptSegment } from '../src/shared/types';
 import { applyMutation, emptyState, migrateSettings, retainHistory } from '../src/shared/state';
@@ -59,6 +60,7 @@ const WHISPER_BIN = app.isPackaged ? path.join(RES, 'whisper/whisper-server') : 
 /** test-only: `ROYFLOW_SELFTEST_WAV=x.wav "Roy Flow.app/Contents/MacOS/Roy Flow"` runs the WAV through the Whisper
     engine path, logs the transcript and quits (does not touch the running app or its data) */
 const SELFTEST_WAV = process.env.ROYFLOW_SELFTEST_WAV;
+const TEST_AUDIO = process.env.ROYFLOW_TEST_AUDIO;
 
 const HUB = { width: 1350, height: 850, minWidth: 1140, minHeight: 750 };
 const CSP = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; media-src 'self' blob:; connect-src 'self'";
@@ -301,6 +303,7 @@ function openScratchpad() {
 /* ------------------------------------------------------------------ Flow Bar panel window */
 const BAR_SIZE: Record<DockEdge, { width: number; height: number }> = {
   bottom: { width: 620, height: 380 },
+  top: { width: 620, height: 380 },
   left: { width: 460, height: 460 },
   right: { width: 460, height: 460 },
 };
@@ -309,7 +312,7 @@ function flowBarConfig(): FlowBarConfig {
   const dock = String(setting('flowBarDock', 'Bottom')).toLowerCase() as DockEdge;
   return {
     show: setting('showFlowBar', true),
-    dock: dock === 'left' || dock === 'right' ? dock : 'bottom',
+    dock: dock === 'left' || dock === 'right' || dock === 'top' ? dock : 'bottom',
     scratchpadInBar: setting('scratchpadInBar', true),
     transformsOptIn: setting('transformsOptIn', true),
     labels: {
@@ -326,21 +329,63 @@ function flowBarConfig(): FlowBarConfig {
 }
 const pushBarConfig = () => sendTo(bar, 'flowbar:config', flowBarConfig());
 
-/** while only the pill is showing the panel shrinks to this, so it covers (and composites) as little screen as possible */
+/** while only the pill (and its hover tooltips) is showing the panel shrinks to this. Tooltips must fit: resizing the
+    window under the pointer made the bar lose hover and flicker. Outside the pill the panel is click-through. */
 const BAR_SMALL: Record<DockEdge, { width: number; height: number }> = {
-  bottom: { width: 300, height: 110 },
-  left: { width: 120, height: 320 },
-  right: { width: 120, height: 320 },
+  bottom: { width: 440, height: 110 },
+  top: { width: 440, height: 110 },
+  left: { width: 420, height: 320 },
+  right: { width: 420, height: 320 },
 };
 let barExpanded = false;
 let barDisplay: Electron.Display | null = null;
 
 function barBounds(dock: DockEdge, area: Rectangle): Rectangle {
   const { width, height } = (barExpanded ? BAR_SIZE : BAR_SMALL)[dock];
-  const y = Math.round(area.y + (area.height - height) / 2);
+  // where along its edge the bar sits (0 = start, 0.5 = centre, 1 = end), set by dragging it
+  const along = Math.min(1, Math.max(0, Number(setting('flowBarAlong', '0.5')) || 0.5));
+  const clamp = (v: number, lo: number, hi: number) => Math.round(Math.min(hi, Math.max(lo, v)));
+  const x = clamp(area.x + area.width * along - width / 2, area.x, area.x + area.width - width);
+  const y = clamp(area.y + area.height * along - height / 2, area.y, area.y + area.height - height);
   if (dock === 'left') return { x: area.x, y, width, height };
   if (dock === 'right') return { x: area.x + area.width - width, y, width, height };
-  return { x: Math.round(area.x + (area.width - width) / 2), y: area.y + area.height - height, width, height };
+  if (dock === 'top') return { x, y: area.y, width, height };
+  return { x, y: area.y + area.height - height, width, height };
+}
+
+/* drag to move (Wispr): the panel follows the pointer, then snaps to the nearest screen edge */
+let barDrag: { timer: NodeJS.Timeout; dx: number; dy: number } | null = null;
+function dragBar(phase: 'start' | 'end') {
+  if (!bar || bar.isDestroyed()) return;
+  if (phase === 'start') {
+    if (barDrag) return;
+    const c = screen.getCursorScreenPoint();
+    const b = bar.getBounds();
+    barDrag = {
+      dx: c.x - b.x,
+      dy: c.y - b.y,
+      timer: setInterval(() => {
+        const p = screen.getCursorScreenPoint();
+        bar?.setPosition(p.x - barDrag!.dx, p.y - barDrag!.dy);
+      }, 16),
+    };
+    return;
+  }
+  if (!barDrag) return;
+  clearInterval(barDrag.timer);
+  barDrag = null;
+  const p = screen.getCursorScreenPoint();
+  const display = screen.getDisplayNearestPoint(p);
+  const a = display.workArea;
+  const fx = (p.x - a.x) / a.width;
+  const fy = (p.y - a.y) / a.height;
+  const edges: [DockEdge, number][] = [['left', fx], ['right', 1 - fx], ['top', fy], ['bottom', 1 - fy]];
+  const dock = edges.sort((m, n) => m[1] - n[1])[0][0];
+  const along = dock === 'left' || dock === 'right' ? fy : fx;
+  barDisplay = display;
+  mainPatch({ settings: { ...(D().settings ?? {}), flowBarDock: dock[0].toUpperCase() + dock.slice(1), flowBarAlong: String(Math.round(along * 1000) / 1000) } });
+  positionBar();
+  pushBarConfig();
 }
 
 function positionBar(onCursorDisplay = false) {
@@ -391,10 +436,19 @@ function setBarInteractive(on: boolean) {
 let barPinnedUntil = 0; // keep the bar up briefly for notices/diffs even when "show at all times" is off
 function updateBarVisibility() {
   if (!bar || bar.isDestroyed()) return;
-  const want = flowBarConfig().show || phase !== 'idle' || !!meeting || Date.now() < barPinnedUntil;
+  const want = (flowBarConfig().show && Date.now() >= barHiddenUntil) || phase !== 'idle' || !!meeting || Date.now() < barPinnedUntil;
   if (want && !bar.isVisible()) bar.showInactive();
   if (!want && bar.isVisible()) bar.hide();
 }
+/** "Hide for 1 hour" (Wispr): the idle bar stays away until then; dictation still shows it */
+let barHiddenUntil = 0;
+function hideBarForAnHour() {
+  barHiddenUntil = Date.now() + 60 * 60_000;
+  setTimeout(updateBarVisibility, 60 * 60_000 + 50);
+  pinBar(6000); // long enough to read the note and press Undo
+  notice('Flow Bar hidden for 1 hour', undefined, { id: 'unhide-bar', label: 'Undo' });
+}
+
 function pinBar(ms: number) {
   barPinnedUntil = Date.now() + ms;
   updateBarVisibility();
@@ -404,7 +458,15 @@ function pinBar(ms: number) {
 /* ------------------------------------------------------------------ sounds + mute */
 function sound(name: 'start' | 'stop' | 'cancel' | 'notify') {
   if (!setting('sounds', true)) return;
-  helper.send({ cmd: 'sound', path: path.join(SOUNDS, `${name}.wav`), volume: 0.45 });
+  const style = SOUND_STYLES[setting('soundStyle', 'Bell')] ?? '';
+  helper.send({ cmd: 'sound', path: path.join(SOUNDS, style, `${name}.wav`), volume: 0.45 });
+}
+/** Settings › Sound › Sound style: folder under resources/sounds ('' = the original bell) */
+const SOUND_STYLES: Record<string, string> = { Bell: '', Soft: 'soft', Click: 'click', Chime: 'chime' };
+
+/** dictation start/stop/cancel sounds: off unless turned on (Settings › Sound); the waveform shows the state */
+function dictationSound(name: 'start' | 'stop' | 'cancel') {
+  if (setting('dictationSounds', false)) sound(name);
 }
 let muted = false;
 function mute(on: boolean) {
@@ -456,7 +518,7 @@ function setPhase(p: DictationPhase, extra: Partial<DictationStatus> = {}) {
   phase = p;
   if (extra.kind) phaseKind = extra.kind;
   if (p === 'idle') phaseKind = 'dictation';
-  broadcast('dictation:status', { phase: p, interim, kind: phaseKind, ...extra });
+  broadcast('dictation:status', { phase: p, interim, kind: phaseKind, handsFree: mode === 'toggle', ...extra });
   updateBarVisibility();
   syncContext();
 }
@@ -493,7 +555,7 @@ async function startDictation(how: 'toggle' | 'ptt') {
   // prewarm: (re)load the model while the user speaks (memory saver may have unloaded it)
   if (dictEngine === 'whisper') {
     clearTimeout(unloadTimer);
-    if (useParakeet() && parakeet.running) void parakeet.start().catch(() => {});
+    if (useParakeet() && parakeet.running) parakeet.warm(); // wake the Neural Engine while you speak
     else void whisper.start().catch(() => {});
   }
   // Whisper needs the audio even when history audio is off: a temporary file, deleted once transcribed
@@ -512,7 +574,7 @@ async function startDictation(how: 'toggle' | 'ptt') {
     engine: dictEngine,
   });
   if (!ok) return failDictation('Could not start the native helper');
-  sound('start');
+  dictationSound('start');
   setTimeout(() => phase === 'recording' && mute(true), 280);
   setPhase('recording', { kind: 'dictation' });
   armCap();
@@ -564,6 +626,18 @@ function initWhisper() {
   whisper = new WhisperServer({ bin: WHISPER_BIN, modelsDir: dir, stateFile: userFile('whisper-state.json'), log });
   parakeet = new Parakeet(PARAKEET_BIN, dir, log);
   parakeet.on('status', (st) => broadcast('parakeet:status', st));
+  if (process.env.ROYFLOW_SELFTEST_FEATURES) setTimeout(() => void runFeatureSelfTest(process.env.ROYFLOW_SELFTEST_FEATURES!), 8000);
+  // test-only (ROYFLOW_TEST_AUDIO + ROYFLOW_TEST_RUNS=n): n timed hands-free dictations after idle gaps
+  if (TEST_AUDIO && process.env.ROYFLOW_TEST_RUNS)
+    parakeet.once('ready', async () => {
+      for (let i = 0; i < Number(process.env.ROYFLOW_TEST_RUNS); i++) {
+        await new Promise((r) => setTimeout(r, 20_000 + (i % 2) * 40_000)); // idle 20 s or 60 s
+        await startDictation('toggle');
+        await new Promise((r) => setTimeout(r, 2500));
+        await stopDictation();
+      }
+      log('[test] runs done');
+    });
   let prev: WhisperStatus['server'] = 'stopped';
   whisper.on('status', (st: WhisperStatus) => {
     broadcast('whisper:status', st);
@@ -711,6 +785,12 @@ async function stopDictation() {
   const savedClip = saveClipboard();
   let fin = await finishRecording();
   session = null;
+  if (TEST_AUDIO) {
+    // test-only (ROYFLOW_TEST_AUDIO): use a known recording instead of the mic, so end-to-end timing can be measured
+    const tmp = path.join(app.getPath('temp'), `royflow-test-${Date.now()}.wav`);
+    copyFileSync(TEST_AUDIO, tmp);
+    fin = { ...fin, audio: tmp, engine: 'whisper', temp: true };
+  }
   if (heldMs >= MIN_RECORDING_MS && fin.engine === 'whisper') {
     try {
       fin = await speechToText(fin);
@@ -733,7 +813,15 @@ async function stopDictation() {
     interim = '';
     return setPhase('idle');
   }
-  sound('stop');
+  dictationSound('stop');
+  if (commandRun) {
+    const run = commandRun;
+    commandRun = null;
+    if (run.kind === 'instruct') await runInstruct(raw, await run.screen!, await savedClip);
+    else await runCommand(raw, await run.selection, await savedClip);
+    interim = '';
+    return;
+  }
   await deliver(raw, fin, pendingId, startedAt, frontApp, await savedClip, timing);
   interim = '';
   setPhase('idle');
@@ -746,9 +834,23 @@ function discardAudio(file: string | null) {
 
 /** clean up, paste and record one dictation */
 async function deliver(raw: string, fin: Final, id: string, ts: number, app: { bundleId: string; name: string }, savedClip?: ClipboardItem[], t?: typeof timing) {
-  const out = await processDictation(raw, app);
-  const res = await pasteText(out.text, savedClip);
-  if (res.pasted) learnAfterPaste(out.text);
+  // Wispr: "press enter" at the very end of a dictation pastes the rest, then presses Return (e.g. to send a message)
+  const { text: spoken, enter } = splitPressEnter(raw);
+  raw = spoken;
+  const out = raw ? await processDictation(raw, app) : { text: '', fixes: 0, dictFixes: 0, engine: 'rules' as const, note: undefined };
+  // optional, off by default: "Spoken with Roy Flow" under emails (Wispr's email signature)
+  if (out.text && setting('emailSignature', false) && categoryFor(app.bundleId) === 'email') out.text += '\n\nSpoken with Roy Flow';
+  // optional, off by default: in chat apps each sentence goes out as its own message (Wispr's stacked messages)
+  const parts = out.text && !enter && setting('stackedMessages', false) && ['personal', 'work'].includes(categoryFor(app.bundleId)) ? stackMessages(out.text) : [out.text];
+  let res: { pasted: boolean; reason?: string } = { pasted: true };
+  for (const [i, part] of parts.entries()) {
+    if (!part) continue;
+    res = await pasteText(part, i === parts.length - 1 ? savedClip : undefined);
+    if (!res.pasted) break;
+    if (i < parts.length - 1) await helper.request({ cmd: 'enter' }, 'entered', 1000).catch(() => null);
+  }
+  if (enter && res.pasted) await helper.request({ cmd: 'enter' }, 'entered', 1000).catch(() => null);
+  if (res.pasted && !TEST_AUDIO) learnAfterPaste(out.text);
   if (t?.keyUpAt) {
     const now = Date.now();
     const { keyDownAt: _k, keyUpAt, finalAt, ...rest } = t;
@@ -771,7 +873,7 @@ async function deliver(raw: string, fin: Final, id: string, ts: number, app: { b
     engine: out.engine,
     speech: fin.engine ?? 'apple',
   };
-  mutate({ collection: 'history', op: 'add', item });
+  if (!TEST_AUDIO) mutate({ collection: 'history', op: 'add', item }); // test runs stay out of your history
   broadcast('dictation:result', { item, ...res, note: out.note });
 }
 
@@ -781,17 +883,18 @@ const UNDO_MS = 6000;
 
 function cancelDictation(silent = false) {
   if (phase !== 'recording') return;
+  commandRun = null;
   mute(false);
   interim = '';
   const heldMs = Date.now() - startedAt;
   if (silent || heldMs < 1000) {
     helper.send({ cmd: 'cancel' });
     session = null;
-    if (!silent) sound('cancel');
+    if (!silent) dictationSound('cancel');
     return setPhase('idle');
   }
   // Esc after real speech: finish recognition in the background and offer Undo
-  sound('cancel');
+  dictationSound('cancel');
   dropCancelled();
   const id = pendingId;
   const raw = finishRecording().then((f) => {
@@ -960,11 +1063,12 @@ async function processDictation(raw: string, target: { bundleId: string; name: s
   const level = codeAware ? 'Light' : setting('autoCleanup', 'Medium');
   const d1 = applyDictionary(raw, dict);
   // rule-based clean-up is synchronous: this is what gets pasted unless Claude answers within the budget
-  const rules = codeAware ? cleanUp(d1.text, 'Light') : styleText(cleanUp(d1.text, level), style);
+  // "None" (Wispr): paste exactly what was heard, only dictionary words fixed
+  const rules = level === 'None' ? d1.text : codeAware ? cleanUp(d1.text, 'Light') : styleText(cleanUp(d1.text, level), style);
   let text = rules;
   let engine: 'claude' | 'rules' = 'rules';
   let note: string | undefined;
-  if (claudeCleanupOn()) {
+  if (claudeCleanupOn() && level !== 'None') {
     const budget = live ? CLEANUP_TIMEOUT_MS : 8000;
     try {
       const t0 = Date.now();
@@ -1007,6 +1111,62 @@ function rememberChange(c: TransformChange) {
   changesUntil = Date.now() + 120_000;
   syncContext();
   setTimeout(syncContext, 120_500);
+}
+
+/** Command Mode state: the selection captured when the key went down */
+let commandRun: { kind: 'command' | 'instruct'; selection: Promise<string>; screen?: Promise<{ text: string; app: string }> } | null = null;
+
+/** copy the current selection without disturbing the clipboard ('' when nothing is selected or no access) */
+async function captureSelection(): Promise<string> {
+  if (!(await accessibilityTrusted())) return '';
+  const saved = await saveClipboard();
+  const sentinel = `⁣royflow-${Date.now()}`;
+  await clipboard.writeText(sentinel);
+  await helper.request({ cmd: 'copy' }, 'copied', 1000);
+  let selection = '';
+  for (let i = 0; i < 12; i++) {
+    await new Promise((r) => setTimeout(r, 50));
+    const cur = await clipboard.readText();
+    if (cur !== sentinel) {
+      selection = cur;
+      break;
+    }
+  }
+  await restoreClipboard(saved);
+  return selection;
+}
+
+/** draft text from a spoken Instruct Mode instruction with the window's text as context, and paste it */
+async function runInstruct(instruction: string, screen: { text: string; app: string }, savedClip?: ClipboardItem[]) {
+  setPhase('processing', { kind: 'transform', label: 'Instruct' });
+  let out = '';
+  try {
+    out = await ai.runInstruct(instruction, screen.text, screen.app);
+  } catch (e) {
+    return failDictation(ai.errorText(e));
+  }
+  if (!out) return failDictation('Instruct Mode returned no text.');
+  const r = await pasteText(out, savedClip);
+  if (!r.pasted) notice(r.reason ?? 'Copied to the clipboard', 'error');
+  log('[instruct]', { screen: screen.text.length, instruction: instruction.length, result: out.length });
+  setPhase('idle');
+}
+
+/** run a spoken Command Mode instruction on the captured selection and paste the result over it */
+async function runCommand(instruction: string, selection: string, savedClip?: ClipboardItem[]) {
+  setPhase('processing', { kind: 'transform', label: 'Command' });
+  let after = '';
+  try {
+    after = await ai.runCommand(instruction, selection);
+  } catch (e) {
+    return failDictation(ai.errorText(e));
+  }
+  if (!after) return failDictation('Command Mode returned no text.');
+  if (selection.trim()) rememberChange({ name: 'Command', before: selection, after });
+  const r = await pasteText(after, savedClip);
+  if (!r.pasted) notice(r.reason ?? 'Copied to the clipboard', 'error');
+  log('[command]', { selection: selection.length, instruction: instruction.length, result: after.length });
+  setPhase('idle');
 }
 
 async function transformHotkey(id: string) {
@@ -1532,7 +1692,7 @@ const MEETING_TRACE = process.env.ROYFLOW_MEETING_TRACE ? path.join(app.getPath(
 helper.on('message', (m: HelperMessage) => {
   if (MEETING_TRACE && session === 'meeting' && ['chunk', 'system'].includes(m.type))
     appendFileSync(MEETING_TRACE, JSON.stringify({ ms: Date.now(), type: m.type, source: m.source, text: m.text ?? m.heard, start: m.start, seconds: m.seconds }) + '\n');
-  if (!['level', 'partial', 'keys', 'segment', 'access', 'activated', 'focusedText', 'frontmost', 'chunk', 'preview'].includes(m.type)) log('[helper]', m.type === 'final' ? { type: 'final', chars: String(m.text ?? '').length, via: m.via, stopMs: m.stopMs } : m);
+  if (!['level', 'partial', 'keys', 'segment', 'access', 'activated', 'focusedText', 'windowText', 'frontmost', 'chunk', 'preview'].includes(m.type)) log('[helper]', m.type === 'final' ? { type: 'final', chars: String(m.text ?? '').length, via: m.via, stopMs: m.stopMs } : m);
   switch (m.type) {
     case 'partial':
       if (session === 'meeting' && meeting) {
@@ -1670,6 +1830,39 @@ let lastPttTap = 0;
 
 function onHotkey(action: string, ph: string) {
   log('[hotkey]', action, ph);
+  if (action === 'instruct') {
+    // Instruct Mode (Wispr): hold, say what to write, release; the window's text is the context
+    if (ph === 'down') {
+      if (phase !== 'idle' && phase !== 'error') return;
+      if (!ai.hasKey()) return notice('Instruct Mode needs your Anthropic API key (Settings › Account).', 'error');
+      if (!setting('transformsOptIn', true)) return notice('Transforms are off. Turn on “Opt in” on the Transforms page.', 'error');
+      const screen = helper.request<{ type: 'windowText'; text: string; app?: string }>({ cmd: 'windowText' }, 'windowText', 1500).then((r) => ({ text: r?.text ?? '', app: r?.app ?? '' }), () => ({ text: '', app: '' }));
+      commandRun = { kind: 'instruct', selection: Promise.resolve(''), screen };
+      pttDownAt = Date.now();
+      void startDictation('ptt');
+    } else if (ph === 'up' || ph === 'abort') {
+      if (phase !== 'recording' || !commandRun) return;
+      if (Date.now() - pttDownAt < 350) return cancelDictation(true);
+      void stopDictation();
+    }
+    return;
+  }
+  if (action === 'command') {
+    // Command Mode (Wispr): hold, say what to do with the selected text, release
+    if (ph === 'down') {
+      if (phase !== 'idle' && phase !== 'error') return;
+      if (!ai.hasKey()) return notice('Command Mode needs your Anthropic API key (Settings › Account).', 'error');
+      if (!setting('transformsOptIn', true)) return notice('Transforms are off. Turn on “Opt in” on the Transforms page.', 'error');
+      commandRun = { kind: 'command', selection: captureSelection() };
+      pttDownAt = Date.now();
+      void startDictation('ptt');
+    } else if (ph === 'up' || ph === 'abort') {
+      if (phase !== 'recording' || !commandRun) return;
+      if (Date.now() - pttDownAt < 350) return cancelDictation(true);
+      void stopDictation();
+    }
+    return;
+  }
   if (action === 'ptt') {
     if (ph === 'down') {
       if (phase === 'recording' && mode === 'toggle') return void stopDictation(); // tap PTT to finish hands-free
@@ -1801,6 +1994,7 @@ async function accessibilityTrusted(prompt = false): Promise<boolean> {
 }
 
 async function pasteText(text: string, restore?: ClipboardItem[]): Promise<{ pasted: boolean; reason?: string }> {
+  if (TEST_AUDIO) return { pasted: true }; // test-only: never touch the clipboard or type into the user's app
   const saved = restore ?? (await saveClipboard());
   await clipboard.writeText(text);
   await new Promise((r) => setTimeout(r, 15));
@@ -2064,12 +2258,13 @@ function onDataChanged(prev: Partial<State>, keys: string[]) {
     const s = n.settings ?? {};
     if (s.showInDock !== p.showInDock) applyDockPolicy();
     if (s.launchAtLogin !== p.launchAtLogin) applyLoginItem();
-    if (s.flowBarDock !== p.flowBarDock) positionBar();
+    if (s.flowBarDock !== p.flowBarDock || s.flowBarAlong !== p.flowBarAlong) positionBar();
     if (s.hideInCapture !== p.hideInCapture) bar?.setContentProtection(!!s.hideInCapture);
     if (s.showNextMeeting !== p.showNextMeeting || s.connected_gcal !== p.connected_gcal || s.connected_outlook !== p.connected_outlook) updateTrayTitle();
     if (s.muteWhileDictating === false && muted) mute(false);
     if (s.microphone !== p.microphone || s.language !== p.language) warmMic();
-    if (s.localStorage !== p.localStorage) applyRetention();
+    if (s.localStorage !== p.localStorage || s.meetingRetention !== p.meetingRetention) applyRetention();
+    if (s.soundStyle !== p.soundStyle) sound('start'); // let the user hear the style they picked
     if (s.engine !== p.engine) applyEngine();
     if (s.unloadModel !== p.unloadModel) armUnload();
     if (s.focusMode !== p.focusMode || s.focusApps !== p.focusApps) focusCheckFrontmost();
@@ -2100,6 +2295,13 @@ function warmMic() {
 function applyRetention() {
   const kept = retainHistory(D().history ?? [], setting('localStorage', 'Store normally'));
   if (kept) mainPatch({ history: kept });
+  // Notetaker transcript retention (Settings › Notetaker), "Forever" by default
+  const old = expiredMeetings(D().meetings ?? [], setting('meetingRetention', 'Forever'));
+  if (old.length) {
+    const gone = new Set(old.map((m) => m.id));
+    mainPatch({ meetings: (D().meetings ?? []).filter((m) => !gone.has(m.id)) });
+    log('[retention] deleted old meeting notes', { count: old.length });
+  }
 }
 
 function applyLoginItem() {
@@ -2145,8 +2347,28 @@ function wireIpc() {
     barExpanded = !!on;
     positionBar();
   });
+  // right-click on the bar: move it to another edge, or hide it while idle
+  ipcMain.on('flowbar:drag', (_e, phase: 'start' | 'end') => dragBar(phase));
+  ipcMain.on('flowbar:menu', () => {
+    const dock = flowBarConfig().dock;
+    const set = (k: string, v: string | boolean) => mainPatch({ settings: { ...(D().settings ?? {}), [k]: v } });
+    Menu.buildFromTemplate([
+      { label: 'Position', enabled: false },
+      ...(['Bottom', 'Top', 'Left', 'Right'] as const).map((p) => ({ label: p, type: 'radio' as const, checked: dock === p.toLowerCase(), click: () => set('flowBarDock', p) })),
+      { type: 'separator' },
+      { label: 'Back to the centre', enabled: setting('flowBarAlong', '0.5') !== '0.5', click: () => set('flowBarAlong', '0.5') },
+      { type: 'separator' },
+      { label: 'Hide for 1 hour', click: () => hideBarForAnHour() },
+      { label: 'Show only while dictating', type: 'checkbox', checked: !setting('showFlowBar', true), click: (i) => set('showFlowBar', !i.checked) },
+      { label: 'Settings…', click: () => showHub() },
+    ]).popup({ window: bar ?? undefined });
+  });
   ipcMain.on('flowbar:action', (_e, id: string) => {
     if (id === 'undo-cancel') void undoCancel();
+    else if (id === 'unhide-bar') {
+      barHiddenUntil = 0;
+      updateBarVisibility();
+    }
     else if (typeof id === 'string' && id.startsWith('switch-mic:')) switchMic(id.slice(11));
   });
   ipcMain.on('flowbar:ready', () => {
@@ -2180,7 +2402,8 @@ function wireIpc() {
     }
     return { version: app.getVersion(), packaged: app.isPackaged, fullName, dataDir: app.getPath('userData') };
   });
-  ipcMain.handle('ai:status', () => ({ hasKey: ai.hasKey(), encryption: ai.encryptionAvailable(), hint: ai.keyHint() }));
+  // no Keychain access here when a key is saved (it can prompt); only checked when there is no key yet
+  ipcMain.handle('ai:status', () => ({ hasKey: ai.hasKey(), encryption: ai.hasKey() || ai.encryptionAvailable(), hint: ai.keyHint() }));
   ipcMain.handle('ai:usage', () => aiUsageStatus());
   ipcMain.handle('ai:setKey', (_e, { key }: { key: string }) => ai.setKey(String(key ?? '')));
   ipcMain.handle('ai:clearKey', () => ai.clearKey());
@@ -2285,6 +2508,35 @@ function wireIpc() {
   });
   ipcMain.handle('meeting:live', (_e, { show }: { show: boolean }) => (show ? meeting && showLive() : closeLive()));
   ipcMain.handle('meeting:open', (_e, { id }: { id: string }) => showHub({ page: 'notetaker', meeting: id }));
+  // import a transcript from Otter, Granola, Zoom or Teams (VTT, SRT or text) as a meeting note, then summarise it
+  ipcMain.handle('meeting:import', async () => {
+    const pick = await dialog.showOpenDialog({ title: 'Import a meeting transcript', properties: ['openFile'], filters: [{ name: 'Transcripts', extensions: ['txt', 'vtt', 'srt', 'md'] }] });
+    const file = pick.filePaths[0];
+    if (pick.canceled || !file) return { ok: false };
+    try {
+      const transcript = parseTranscript(readFileSync(file, 'utf8'));
+      if (!transcript.length) return { ok: false, error: 'No transcript lines were found in that file.' };
+      const last = transcript[transcript.length - 1];
+      const m: Meeting = {
+        id: `m-${Date.now()}`,
+        title: path.basename(file).replace(/\.[^.]+$/, ''),
+        ts: statSync(file).mtimeMs,
+        minutes: Math.max(1, Math.round(last.t / 60)),
+        people: new Set(transcript.map((s) => s.speaker).filter(Boolean)).size,
+        overview: '',
+        transcript,
+        durationSec: Math.round(last.t),
+        summaryStatus: 'pending',
+      };
+      mutate({ collection: 'meetings', op: 'add', item: m });
+      if (featureOn('summaries', D().settings ?? {})) void summarize(m);
+      else mutate({ collection: 'meetings', op: 'patch', id: m.id, patch: { summaryStatus: 'done' } });
+      log('[meeting] imported', { lines: transcript.length });
+      return { ok: true, id: m.id };
+    } catch (e) {
+      return { ok: false, error: (e as Error).message };
+    }
+  });
   ipcMain.handle('audio:get', (_e, { file }: { file: string }) => {
     const p = audioPath(String(file));
     if (!p || !existsSync(p)) return null;
@@ -2411,6 +2663,22 @@ async function runWhisperSelfTest(file: string) {
     result.cleaned = cleanUp(applyDictionary(fin.text, dict).text, 'Medium');
     log('[selftest] transcript:', fin.text);
     code = fin.text.trim() ? 0 : 2;
+    if (process.env.ROYFLOW_SELFTEST_LATENCY) {
+      // dictation latency after idle, like real use: wait, wake on "key-down", speak (1 s), then transcribe
+      const runs: { file: string; idleS: number; transcribeMs: number }[] = [];
+      for (const f of process.env.ROYFLOW_SELFTEST_LATENCY.split(',')) {
+        for (const idleS of [20, 60]) {
+          await new Promise((r) => setTimeout(r, idleS * 1000));
+          if (useParakeet()) parakeet.warm();
+          await new Promise((r) => setTimeout(r, 1000));
+          const t = Date.now();
+          await speechToText({ text: '', audio: f, seconds: 0, engine: 'whisper' });
+          runs.push({ file: path.basename(f), idleS, transcribeMs: Date.now() - t });
+          log('[selftest] latency', runs[runs.length - 1]);
+        }
+      }
+      result.latency = runs;
+    }
     if (process.env.ROYFLOW_SELFTEST_AI) {
       // one real key test (Haiku, a few tokens) through the spending controls
       result.aiTest = await ai.testKey();
@@ -2448,6 +2716,82 @@ async function runWhisperSelfTest(file: string) {
     console.log(JSON.stringify(result));
     app.exit(code);
   }
+}
+
+
+/* ------------------------------------------------------------------ feature self-test (test-only, ROYFLOW_SELFTEST_FEATURES=<out.json>)
+   Exercises the new Flow Bar and AI features through their real code paths without pasting or pressing keys
+   in any app; writes pass/fail per feature. */
+async function runFeatureSelfTest(out: string) {
+  const r: Record<string, unknown> = { at: new Date().toISOString() };
+  const step = async (name: string, f: () => Promise<unknown>) => {
+    try {
+      r[name] = { ok: true, ...((await f()) as object) };
+    } catch (e) {
+      r[name] = { ok: false, error: String((e as Error).message ?? e) };
+    }
+    log('[selftest] feature', name, (r[name] as { ok: boolean }).ok);
+    writeFileSync(out, JSON.stringify(r, null, 2)); // saved after every step (the AI steps may wait on a Keychain prompt)
+  };
+  const wait = (ms: number) => new Promise((res) => setTimeout(res, ms));
+  const saved = { dock: setting('flowBarDock', 'Bottom'), along: setting('flowBarAlong', '0.5') };
+  await step('pressEnter', async () => {
+    const a = splitPressEnter('See you at five, press enter.');
+    if (!a.enter || a.text !== 'See you at five') throw new Error(JSON.stringify(a));
+    return { text: a.text };
+  });
+  await step('hideForAnHour', async () => {
+    const before = bar?.isVisible();
+    hideBarForAnHour();
+    await wait(6300); // the Undo note keeps it up for 6 s
+    const hidden = !bar?.isVisible();
+    barHiddenUntil = 0; // what Undo does
+    updateBarVisibility();
+    const back = !!bar?.isVisible();
+    if (!before || !hidden || !back) throw new Error(JSON.stringify({ before, hidden, back }));
+    return { before, hidden, back };
+  });
+  await step('dragSnap', async () => {
+    const b0 = bar!.getBounds();
+    dragBar('start');
+    await wait(100);
+    dragBar('end');
+    const dock = setting('flowBarDock', 'Bottom');
+    const along = setting('flowBarAlong', '0.5');
+    const b1 = bar!.getBounds();
+    // put the user's position back
+    mainPatch({ settings: { ...(D().settings ?? {}), flowBarDock: saved.dock, flowBarAlong: saved.along } });
+    positionBar();
+    return { snappedTo: dock, along, before: b0, after: b1 };
+  });
+  await step('menuPositions', async () => {
+    for (const p of ['Top', 'Left', 'Right', 'Bottom']) {
+      mainPatch({ settings: { ...(D().settings ?? {}), flowBarDock: p } });
+      await wait(150);
+      const b = bar!.getBounds();
+      const a = screen.getDisplayMatching(b).workArea;
+      const ok = p === 'Top' ? b.y === a.y : p === 'Bottom' ? b.y + b.height === a.y + a.height : p === 'Left' ? b.x === a.x : b.x + b.width === a.x + a.width;
+      if (!ok) throw new Error(`${p}: ${JSON.stringify(b)}`);
+    }
+    mainPatch({ settings: { ...(D().settings ?? {}), flowBarDock: saved.dock, flowBarAlong: saved.along } });
+    return { checked: 4 };
+  });
+  await step('windowText', async () => {
+    const w = await helper.request<{ type: 'windowText'; text: string; app?: string }>({ cmd: 'windowText' }, 'windowText', 2000);
+    return { chars: w?.text?.length ?? 0 }; // the text itself is never logged
+  });
+  await step('commandMode', async () => {
+    const t = await ai.runCommand('make this all uppercase', 'hello world');
+    if (t.trim() !== 'HELLO WORLD') throw new Error(`got ${JSON.stringify(t)}`);
+    return { result: t };
+  });
+  await step('instructMode', async () => {
+    const t = await ai.runInstruct('reply that I can come on Friday', 'From: Ana\nHi! Can you join the planning meeting on Friday at 10?', 'Mail');
+    if (!/friday/i.test(t)) throw new Error(`got ${JSON.stringify(t)}`);
+    return { chars: t.length, mentionsFriday: true };
+  });
+  writeFileSync(out, JSON.stringify(r, null, 2));
+  log('[selftest] features done');
 }
 
 app.whenReady().then(async () => {

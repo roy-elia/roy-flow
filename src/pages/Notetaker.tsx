@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowUp, ArrowUpRight, CalendarDays, FileText, Folder, MessageSquare, Plus, RotateCw, Search, Settings, Trash2, X } from 'lucide-react';
+import { ArrowUp, ArrowUpRight, CalendarDays, FileText, Folder, MessageSquare, Plus, RotateCw, Search, Settings, Trash2, Upload, X } from 'lucide-react';
 import { setSetting, setState, toast, uid, useStore, type Chat, type ChatMessage, type Meeting } from '../store';
 import { openSettings, setNav, useNav } from '../nav';
 import { Confirm, Tabs } from '../components/ui';
@@ -213,6 +213,19 @@ export default function Notetaker() {
           <div className="row-gap">
             <button className="icon-btn lg" data-tip="Open Notetaker settings" aria-label="Open Notetaker settings" onClick={() => openSettings('notetaker')}>
               <Settings size={20} />
+            </button>
+            <button
+              className="icon-btn lg"
+              data-tip="Import a transcript (Otter, Granola, Zoom, Teams: .txt, .vtt, .srt)"
+              aria-label="Import a transcript"
+              onClick={async () => {
+                if (!native) return toast('Import runs in the desktop app', { tone: 'error' });
+                const r = await native.invoke('meeting:import');
+                if (r.ok && r.id) setNav({ page: 'notetaker', meeting: r.id });
+                else if (r.error) toast(r.error, { tone: 'error' });
+              }}
+            >
+              <Upload size={19} />
             </button>
             <button className={`btn ${status.recording ? 'btn-primary' : 'btn-secondary'}`} onClick={toggleRec} disabled={starting} data-tip={shortcut ? `Shortcut: ${shortcut}` : undefined}>
               <NotetakerIcon size={18} />

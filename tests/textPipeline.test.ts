@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { applyDictionary, applySnippets, changedWords, cleanUp, correctedWords, diffWords, fillSnippet, processTranscript, styleText, wordCount } from '../src/shared/textPipeline';
+import { expiredMeetings, splitPressEnter, stackMessages, applyDictionary, applySnippets, changedWords, cleanUp, correctedWords, diffWords, fillSnippet, processTranscript, styleText, wordCount } from '../src/shared/textPipeline';
 
 describe('cleanUp (rule-based, no API key)', () => {
   it('removes hesitations and capitalises', () => {
@@ -17,6 +17,10 @@ describe('cleanUp (rule-based, no API key)', () => {
   it('removes stutters but keeps legitimate repeats', () => {
     expect(cleanUp('I I think the the plan works')).toBe('I think the plan works.');
     expect(cleanUp('I knew that that was wrong')).toBe('I knew that that was wrong.');
+    // said on purpose: kept (Wispr keeps these too)
+    expect(cleanUp('hello hello hello')).toBe('Hello hello hello.');
+    expect(cleanUp('it is very very good')).toBe('It is very very good.');
+    expect(cleanUp('go go go')).toBe('Go go go.');
   });
   it('handles spoken line breaks', () => {
     expect(cleanUp('hi team new paragraph the build is green new line thanks')).toBe('Hi team.\n\nThe build is green.\nThanks.');
@@ -99,5 +103,38 @@ describe('diff helpers', () => {
   it('word count', () => {
     expect(wordCount('  one two  three ')).toBe(3);
     expect(wordCount('')).toBe(0);
+  });
+});
+
+import { matchSkills, SKILLS } from '../src/shared/skills';
+describe('Notetaker skills', () => {
+  it('lists every skill after "/" and filters by name', () => {
+    expect(matchSkills('/')).toHaveLength(SKILLS.length);
+    expect(matchSkills('/follow').map((s) => s.id)).toEqual(['follow-up']);
+    expect(matchSkills('what happened')).toEqual([]);
+  });
+});
+
+describe('press enter', () => {
+  it('splits a trailing "press enter" off the dictation', () => {
+    expect(splitPressEnter('See you tomorrow, press enter.')).toEqual({ text: 'See you tomorrow', enter: true });
+    expect(splitPressEnter('Press return')).toEqual({ text: '', enter: true });
+    expect(splitPressEnter('Press enter to continue the setup')).toEqual({ text: 'Press enter to continue the setup', enter: false });
+  });
+});
+
+describe('stacked messages and note retention', () => {
+  it('splits paragraphs, else sentences', () => {
+    expect(stackMessages('Hey! Are you free later? Call me.')).toEqual(['Hey!', 'Are you free later?', 'Call me.']);
+    expect(stackMessages('First para. Still first.\n\nSecond para.')).toEqual(['First para. Still first.', 'Second para.']);
+    expect(stackMessages('Just one line')).toEqual(['Just one line']);
+  });
+  it('expires only real notes older than the chosen period', () => {
+    const now = Date.UTC(2026, 10, 10);
+    const day = 86_400_000;
+    const list = [{ id: 'a', ts: now - 2 * day }, { id: 'b', ts: now - 40 * day }, { id: 'c', ts: now - 40 * day, demo: true }];
+    expect(expiredMeetings(list, 'Forever', now)).toEqual([]);
+    expect(expiredMeetings(list, '30 days', now).map((m) => m.id)).toEqual(['b']);
+    expect(expiredMeetings(list, '1 day', now).map((m) => m.id)).toEqual(['a', 'b']);
   });
 });

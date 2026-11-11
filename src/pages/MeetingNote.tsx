@@ -2,6 +2,7 @@
    My thoughts · Transcript · ✦ Summary tabs, transcript bubbles with a language banner, the "N MIN READ"
    summary, and Resume + Ask at the bottom. LiveNoteApp is the same note in the narrow always-on-top panel
    that is open while Notetaker records. */
+import { matchSkills } from '../shared/skills';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowDown,
@@ -165,15 +166,17 @@ export function TranscriptCard({
   let lastT = -1e9;
   shown.forEach((s, i) => {
     const w = whoOf(s.who);
-    if (w !== lastWho || s.t - lastT > 20) {
+    // imported transcripts carry speaker names; recorded ones are You / Them
+    const key = s.speaker ?? w;
+    if (key !== lastWho || s.t - lastT > 20) {
       const at = s.at ?? (startedAt ? startedAt + s.t * 1000 : undefined);
       rows.push(
         <div key={`h${i}`} className={`tc-who ${w}`}>
-          {label(w)} {!live && at ? <span>{wallTime(at)}</span> : null}
+          {s.speaker ?? label(w)} {!live && at ? <span>{wallTime(at)}</span> : null}
         </div>,
       );
     }
-    lastWho = w;
+    lastWho = key;
     lastT = s.t;
     rows.push(
       <div key={i} className={`tc-bubble ${w}`} title={clock(s.t)}>
@@ -347,20 +350,20 @@ const patchMeeting = (id: string, p: Partial<Meeting>) => setState((s) => ({ mee
 /** ask Claude about one note (streamed through ai:ask) */
 function useAsk(context: () => string) {
   const [answer, setAnswer] = useState<{ q: string; text: string; busy: boolean } | null>(null);
-  const ask = async (q: string) => {
+  const ask = async (q: string, label = q) => {
     if (!native) return toast('Ask runs in the desktop app', { tone: 'error' });
     const id = uid();
-    setAnswer({ q, text: '', busy: true });
+    setAnswer({ q: label, text: '', busy: true });
     let text = '';
     const off = native.on('ai:chunk', ({ id: rid, delta }) => {
       if (rid !== id) return;
       text += delta;
-      setAnswer({ q, text, busy: true });
+      setAnswer({ q: label, text, busy: true });
     });
     const r = await native.invoke('ai:ask', { id, messages: [{ role: 'user', content: `${context()}\n\n${q}` }] });
     off();
-    if (!r.ok && !text) setAnswer({ q, text: r.error ?? 'Claude could not answer.', busy: false });
-    else setAnswer({ q, text, busy: false });
+    if (!r.ok && !text) setAnswer({ q: label, text: r.error ?? 'Claude could not answer.', busy: false });
+    else setAnswer({ q: label, text, busy: false });
   };
   return { answer, ask, clear: () => setAnswer(null) };
 }
@@ -574,11 +577,31 @@ export function MeetingDetail({ m, onBack, list, setOpen, onDelete, recording }:
             className="nn-ask"
             onSubmit={(e) => {
               e.preventDefault();
-              if (q.trim()) void ask(q.trim());
+              const skill = matchSkills(q)[0];
+              if (skill) void ask(skill.prompt, skill.label);
+              else if (q.trim()) void ask(q.trim());
               setQ('');
             }}
           >
-            <input value={q} onChange={(e) => setQ(e.target.value)} placeholder={on.ask ? 'Ask anything about this note' : 'Questions are turned off in Settings › Account'} disabled={!on.ask} aria-label="Ask about this note" />
+            {matchSkills(q).length > 0 && (
+              <div className="nn-skills" role="listbox" aria-label="Skills">
+                {matchSkills(q).map((sk) => (
+                  <button
+                    type="button"
+                    key={sk.id}
+                    className="nn-skill"
+                    onClick={() => {
+                      void ask(sk.prompt, sk.label);
+                      setQ('');
+                    }}
+                  >
+                    <b>/{sk.label}</b>
+                    <span>{sk.desc}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+            <input value={q} onChange={(e) => setQ(e.target.value)} placeholder={on.ask ? 'Ask anything, or type / for skills' : 'Questions are turned off in Settings › Account'} disabled={!on.ask} aria-label="Ask about this note" />
             {q && (
               <button className="ask-send" aria-label="Ask">
                 <ArrowUp size={15} />
