@@ -6,7 +6,7 @@ Roy Flow: voice dictation and meeting notes for macOS (Apple silicon) that run o
 - Type: code project (public repository)
 - Owner of this file, skills and structure: roy-elia
 - Integration branch: `main` (never commit to it directly; branch, then pull request)
-- Systems of record: tickets GitHub Issues on this repo (none found in the repo); long-form docs `README.md` and `QA.md`; designs none recorded; research none recorded
+- Systems of record: tickets GitHub Issues on this repo (none found in the repo); long-form docs `README.md` and `docs/qa-1-2.md`; designs none recorded; research none recorded
 
 ## 2. Resolve context before acting
 1. Identify the decision or scope of the request.
@@ -20,13 +20,13 @@ Roy Flow: voice dictation and meeting notes for macOS (Apple silicon) that run o
 |---|---|---|
 | Where files go, sources of truth | `docs/INDEX.md` | Placing or finding any file |
 | Install, requirements, first launch, dev commands | `README.md` | Building or running the app |
-| Control-by-control QA checklist for release 1.2 | `QA.md` | Changing UI behaviour or auditing what works |
+| Control-by-control QA checklist for release 1.2 | `docs/qa-1-2.md` | Changing UI behaviour or auditing what works |
 | Bundled font licences | `FONTS-LICENSE.txt` | Adding or changing fonts |
 
 ## 4. Task-to-context routing
 | Request type | Read first | Load if needed |
 |---|---|---|
-| UI page or component change | `src/pages` | `src/components`, `QA.md` |
+| UI page or component change | `src/pages` | `src/components`, `docs/qa-1-2.md` |
 | Shared logic (state, hotkeys, text pipeline, summaries) | `src/shared` | the matching file in `tests` |
 | Main-process behaviour (windows, IPC, AI, speech, MCP) | `electron` | `src/shared/ipc.ts` |
 | Native helper (shortcuts, permissions, calendar) | `native/RoyFlowHelper.swift` | `native/build.sh`, `scripts/sign.sh` |
@@ -75,7 +75,7 @@ No agent skills in this repo (`.claude/` holds settings and a secret-guard hook)
 - Names: lowercase with hyphens for docs and scripts. Dated records start with `YYYY-MM-DD`.
 - Every tracked Markdown file under `docs/` has front matter (`owner`, `status`, `last_updated`, `source_of_truth`).
 - Update files in place. Do not delete a file others route to: mark it `status: superseded` and point to the replacement.
-- Persistent state writes happen in the main process (`applyMutation` in `src/shared/state.ts`); renderers do not write history directly (from `QA.md`).
+- Persistent state writes happen in the main process (`applyMutation` in `src/shared/state.ts`); renderers do not write history directly (from `docs/qa-1-2.md`).
 - Session discipline: one task per session; compact on purpose at phase boundaries; write the handoff (created on first use) before ending a long session.
 
 ## 11. More detail
@@ -83,7 +83,7 @@ No agent skills in this repo (`.claude/` holds settings and a secret-guard hook)
 - Standard this repo follows: roy-elia/ai-standards `standard.md` (read when changing structure).
 
 ## Owner questions
-- `QA.md` cites Wispr Flow analysis files that are not in this repository (they live in the ghidra-mcp repository). Keep the references, or link them?
+- `docs/qa-1-2.md` cites Wispr Flow analysis files that are not in this repository (they live in the ghidra-mcp repository). Keep the references, or link them?
 - Ticket tracker, wiki, design and research tools: none found; which apply, if any?
 - `ghidra-mcp` tracks a full copy of this repository. Which is the source of truth (see that repository's proposal)?
 - No license file found; is the public repository meant to carry one?
