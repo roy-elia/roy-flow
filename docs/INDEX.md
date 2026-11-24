@@ -14,7 +14,7 @@ There are no other files under `docs/` yet. The long-form documents sit at the r
 | File | Summary (one line) | Read when | Owner |
 |---|---|---|---|
 | `README.md` | What Roy Flow is, install, first launch, update, uninstall, dev commands (root, outside `docs/`) | Building or running the app | roy-elia |
-| `QA.md` | Control-by-control QA checklist for release 1.2 (root, outside `docs/`) | Changing UI behaviour | roy-elia |
+| `qa-1-2.md` | Control-by-control QA checklist for release 1.2 | Changing UI behaviour | roy-elia |
 | `FONTS-LICENSE.txt` | Licences of bundled fonts (root, outside `docs/`) | Adding or changing fonts | roy-elia |
 
 ## Where does X go
