@@ -6,7 +6,7 @@ Roy Flow: voice dictation and meeting notes for macOS (Apple silicon) that run o
 - Type: code project (public repository)
 - Owner of this file, skills and structure: roy-elia
 - Integration branch: `main` (never commit to it directly; branch, then pull request)
-- Systems of record: tickets GitHub Issues on this repo (none found in the repo); long-form docs `README.md` and `docs/qa-1-2.md`; designs none recorded; research none recorded
+- Systems of record: tickets GitHub Issues on this repo (none found in the repo); long-form docs `README.md` and `docs/qa-1-2.md`; designs none recorded; research: the Wispr Flow analysis that `docs/qa-1-2.md` and code comments cite lives in the roy-elia/ghidra-mcp repository (`analysis/wispr-flow/`)
 
 ## 2. Resolve context before acting
 1. Identify the decision or scope of the request.
@@ -85,5 +85,4 @@ No agent skills in this repo (`.claude/` holds settings and a secret-guard hook)
 ## Owner questions
 - `docs/qa-1-2.md` cites Wispr Flow analysis files that are not in this repository (they live in the ghidra-mcp repository). Keep the references, or link them?
 - Ticket tracker, wiki, design and research tools: none found; which apply, if any?
-- `ghidra-mcp` tracks a full copy of this repository. Which is the source of truth (see that repository's proposal)?
 - No license file found; is the public repository meant to carry one?
